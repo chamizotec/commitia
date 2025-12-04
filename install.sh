@@ -17,6 +17,7 @@ BOLD='\033[1m'
 
 # Configurações
 REPO_URL="https://github.com/chamizotec/commitia"
+REPO_RAW_URL="https://raw.githubusercontent.com/chamizotec/commitia/main"
 INSTALL_DIR="${COMMITIA_INSTALL_DIR:-$HOME/.local/bin}"
 SCRIPT_NAME="commitia"
 
@@ -49,7 +50,13 @@ warn() {
   echo -e "${YELLOW}⚠ $1${NC}"
 }
 
-# Detecta o diretório do script
+# Detecta se está rodando via pipe (curl | bash)
+is_piped() {
+  # Se BASH_SOURCE está vazio ou não existe, provavelmente está via pipe
+  [ -z "${BASH_SOURCE[0]}" ] || [ "${BASH_SOURCE[0]}" = "bash" ] || [ ! -f "${BASH_SOURCE[0]}" ]
+}
+
+# Detecta o diretório do script (para instalação local)
 get_script_dir() {
   local source="${BASH_SOURCE[0]}"
   while [ -h "$source" ]; do
@@ -70,6 +77,12 @@ check_dependencies() {
     error "Git não encontrado. Instale o Git primeiro."
   fi
   success "Git encontrado"
+  
+  # curl é necessário para instalação remota
+  if ! command -v curl &>/dev/null; then
+    error "curl não encontrado. Instale o curl primeiro."
+  fi
+  success "curl encontrado"
   
   # Verifica provedores de IA (pelo menos um)
   local has_provider=false
@@ -98,11 +111,17 @@ check_dependencies() {
     echo "  • OpenAI: Configure OPENAI_API_KEY"
     echo "  • Ollama: https://ollama.ai"
     echo ""
-    echo -e "${YELLOW}Deseja continuar a instalação mesmo assim? [s/N]${NC}"
-    read -r -n 1 response
-    echo ""
-    if [[ ! $response =~ ^[Ss]$ ]]; then
-      exit 1
+    
+    # Se está via pipe, não pode ler input, então continua
+    if is_piped; then
+      warn "Continuando instalação (modo não-interativo)..."
+    else
+      echo -e "${YELLOW}Deseja continuar a instalação mesmo assim? [s/N]${NC}"
+      read -r -n 1 response
+      echo ""
+      if [[ ! $response =~ ^[Ss]$ ]]; then
+        exit 1
+      fi
     fi
   fi
 }
@@ -115,19 +134,35 @@ create_install_dir() {
   fi
 }
 
-# Instala o script
+# Instala o script (baixa do GitHub ou copia local)
 install_script() {
-  local script_dir
-  script_dir=$(get_script_dir)
-  local source_file="$script_dir/bin/commitia"
   local target_file="$INSTALL_DIR/$SCRIPT_NAME"
   
-  if [ ! -f "$source_file" ]; then
-    error "Arquivo fonte não encontrado: $source_file"
+  if is_piped; then
+    # Instalação remota: baixa do GitHub
+    info "Baixando $SCRIPT_NAME do GitHub..."
+    
+    if ! curl -fsSL "$REPO_RAW_URL/bin/commitia" -o "$target_file"; then
+      error "Não foi possível baixar o script. Verifique sua conexão."
+    fi
+  else
+    # Instalação local: copia do diretório
+    local script_dir
+    script_dir=$(get_script_dir)
+    local source_file="$script_dir/bin/commitia"
+    
+    if [ ! -f "$source_file" ]; then
+      # Tenta baixar do GitHub como fallback
+      info "Arquivo local não encontrado, baixando do GitHub..."
+      if ! curl -fsSL "$REPO_RAW_URL/bin/commitia" -o "$target_file"; then
+        error "Não foi possível baixar o script. Verifique sua conexão."
+      fi
+    else
+      info "Instalando $SCRIPT_NAME em $INSTALL_DIR..."
+      cp "$source_file" "$target_file"
+    fi
   fi
   
-  info "Instalando $SCRIPT_NAME em $INSTALL_DIR..."
-  cp "$source_file" "$target_file"
   chmod +x "$target_file"
   success "Script instalado com sucesso"
 }
@@ -199,6 +234,7 @@ show_success() {
   echo -e "  ${CYAN}commitia -m \"contexto\"${NC}       # Com contexto adicional"
   echo -e "  ${CYAN}commitia -i${NC}                  # Modo interativo"
   echo -e "  ${CYAN}commitia --help${NC}              # Ver todas as opções"
+  echo -e "  ${CYAN}commitia --update${NC}            # Atualizar para última versão"
   echo ""
   echo -e "${BOLD}Configuração:${NC}"
   echo ""
@@ -224,4 +260,3 @@ main() {
 }
 
 main "$@"
-
