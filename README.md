@@ -22,7 +22,7 @@ CommitIA analisa suas alterações no Git e gera automaticamente mensagens de co
 ### Método rápido (curl)
 
 ```bash
-curl -fsSL https://github.com/chamizotec/commitia/blob/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/chamizotec/commitia/refs/heads/main/install.sh | bash
 ```
 
 ### Instalação manual
