@@ -149,6 +149,9 @@ check_dependencies() {
       if ! command -v ollama &>/dev/null; then
         error "Ollama não encontrado. Instale em: https://ollama.ai"
       fi
+      if ! command -v jq &>/dev/null; then
+        error "jq não encontrado. Instale com: brew install jq"
+      fi
       ;;
     *)
       error "Provedor de IA desconhecido: $AI_PROVIDER"
@@ -382,12 +385,49 @@ generate_with_ollama() {
   local diff
   diff=$(get_staged_diff)
   
-  local full_prompt="$prompt
-
-Diff:
-$diff"
+  # Modelo a usar (prefere llama3.2 se disponível, senão codellama)
+  local model="llama3.2"
+  if ! ollama list 2>/dev/null | grep -q "llama3.2"; then
+    model="codellama"
+  fi
   
-  ollama run codellama "$full_prompt" 2>/dev/null
+  # Prompt mais específico para modelos locais
+  local full_prompt="Você é um gerador de mensagens de commit Git.
+Analise o diff abaixo e gere UMA mensagem de commit seguindo o padrão Conventional Commits.
+
+FORMATO OBRIGATÓRIO: tipo(escopo): descrição curta
+
+TIPOS VÁLIDOS: feat, fix, docs, style, refactor, test, chore, perf, ci, build, revert
+
+REGRAS:
+- Descrição deve começar com letra minúscula
+- Não usar ponto final
+- Ser conciso (máximo 72 caracteres)
+- Retornar APENAS a mensagem, sem explicações
+
+DIFF:
+$diff
+
+MENSAGEM DE COMMIT:"
+
+  # Usa a API REST do Ollama
+  local json_payload
+  json_payload=$(jq -n \
+    --arg model "$model" \
+    --arg prompt "$full_prompt" \
+    '{
+      model: $model,
+      prompt: $prompt,
+      stream: false
+    }')
+  
+  local response
+  response=$(curl -s http://localhost:11434/api/generate \
+    -H "Content-Type: application/json" \
+    -d "$json_payload")
+  
+  # Extrai a resposta
+  echo "$response" | jq -r '.response // empty' 2>/dev/null
 }
 
 generate_commit_message() {
@@ -406,8 +446,15 @@ generate_commit_message() {
       ;;
   esac
   
-  # Extrai a mensagem no formato correto e remove ponto final (commitlint não permite)
-  echo "$output" | grep -oE '(feat|fix|docs|style|refactor|test|chore|perf|ci|build|revert)\([^)]*\):.*' | head -1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\.$//'
+  # Extrai a mensagem no formato correto
+  local msg
+  msg=$(echo "$output" | grep -oE '(feat|fix|docs|style|refactor|test|chore|perf|ci|build|revert)\([^)]*\):.*' | head -1)
+  
+  # Limpa a mensagem:
+  # 1. Remove espaços, ponto final, backticks, asteriscos (markdown)
+  # 2. Converte primeira letra da descrição para minúscula
+  echo "$msg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\.$//;s/`//g;s/\*//g' | \
+    perl -pe 's/^([^:]+:\s*)([A-Z])/$1\l$2/'
 }
 
 # ============================================================================
