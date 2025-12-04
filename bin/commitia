@@ -200,7 +200,7 @@ do_update() {
   fi
   
   echo ""
-  echo -e "  Versão atual:  ${YELLOW}$VERSION${NC}"
+  echo -e "  Versão atual:  ${YELLOW}${VERSION}${NC}"
   echo -e "  Versão remota: ${GREEN}$remote_version${NC}"
   echo ""
   
