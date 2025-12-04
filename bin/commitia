@@ -9,7 +9,7 @@
 
 set -e
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 SCRIPT_NAME="commitia"
 REPO_URL="https://github.com/chamizotec/commitia"
 REPO_RAW_URL="https://raw.githubusercontent.com/chamizotec/commitia/main"
@@ -29,6 +29,7 @@ CONFIG_FILE="${HOME}/.commitiarc"
 DRY_RUN=false
 INTERACTIVE=false
 AMEND=false
+FORCE_UPDATE=false
 
 # ============================================================================
 # Funções de utilidade
@@ -62,6 +63,7 @@ print_help() {
   echo "  --provider <provider>    Define o provedor de IA (amp, openai, ollama)"
   echo "  --lang <idioma>          Idioma da mensagem (pt, en, es)"
   echo "  --update                 Atualiza para a versão mais recente"
+  echo "  --force                  Força atualização (usar com --update)"
   echo "  -v, --version            Mostra a versão"
   echo "  -h, --help               Mostra esta ajuda"
   echo ""
@@ -205,13 +207,19 @@ do_update() {
   echo ""
   
   # Compara versões
-  if [ "$VERSION" = "$remote_version" ]; then
+  if [ "$VERSION" = "$remote_version" ] && [ "$FORCE_UPDATE" = false ]; then
     success "Você já está na versão mais recente!"
+    echo ""
+    info "Use --force para reinstalar mesmo assim"
     exit 0
   fi
   
-  # Pergunta se quer atualizar
-  echo -e "${YELLOW}Deseja atualizar para a versão $remote_version? [S/n]${NC}"
+  # Mensagem apropriada
+  if [ "$VERSION" = "$remote_version" ]; then
+    echo -e "${YELLOW}Reinstalar a mesma versão $remote_version? [S/n]${NC}"
+  else
+    echo -e "${YELLOW}Deseja atualizar para a versão $remote_version? [S/n]${NC}"
+  fi
   read -r -n 1 response
   echo ""
   
@@ -422,6 +430,7 @@ main() {
   CLI_PROVIDER=""
   CLI_LANGUAGE=""
   CLI_AUTO_STAGE=""
+  DO_UPDATE=false
   
   while [[ $# -gt 0 ]]; do
     case $1 in
@@ -434,8 +443,12 @@ main() {
         exit 0
         ;;
       --update)
-        do_update
-        exit 0
+        DO_UPDATE=true
+        shift
+        ;;
+      --force)
+        FORCE_UPDATE=true
+        shift
         ;;
       -m|--message)
         CONTEXT_MSG="$2"
@@ -482,6 +495,12 @@ main() {
         ;;
     esac
   done
+  
+  # Executa update se solicitado
+  if [ "$DO_UPDATE" = true ]; then
+    do_update
+    exit 0
+  fi
   
   # Carrega configuração
   load_config
