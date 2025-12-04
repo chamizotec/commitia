@@ -38,7 +38,7 @@ Adoramos novas ideias! Ao sugerir uma feature:
 
 ```bash
 # Clone o repositório
-git clone https://github.com/seu-usuario/commitia.git
+git clone https://github.com/chamizotec/commitia.git
 cd commitia
 
 # O projeto é um script bash, não precisa de build
@@ -117,14 +117,14 @@ shellcheck bin/commitia
 
 Usamos as seguintes labels nos issues:
 
-| Label | Descrição |
-|-------|-----------|
-| `bug` | Algo não está funcionando |
-| `feature` | Nova funcionalidade |
-| `docs` | Documentação |
-| `good first issue` | Bom para iniciantes |
-| `help wanted` | Precisamos de ajuda |
-| `question` | Dúvidas |
+| Label              | Descrição                 |
+| ------------------ | ------------------------- |
+| `bug`              | Algo não está funcionando |
+| `feature`          | Nova funcionalidade       |
+| `docs`             | Documentação              |
+| `good first issue` | Bom para iniciantes       |
+| `help wanted`      | Precisamos de ajuda       |
+| `question`         | Dúvidas                   |
 
 ## 🎉 Reconhecimento
 
@@ -133,4 +133,3 @@ Contribuidores são reconhecidos no README e nos releases. Agradecemos toda cont
 ---
 
 Dúvidas? Abra um issue ou entre em contato!
-

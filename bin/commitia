@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # CommitIA - Gerador de commits inteligentes com IA
-# https://github.com/seu-usuario/commitia
+# https://github.com/chamizotec/commitia
 #
 # Gera mensagens de commit seguindo o padrão Conventional Commits
 # usando inteligência artificial para analisar suas alterações.
@@ -9,8 +9,10 @@
 
 set -e
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 SCRIPT_NAME="commitia"
+REPO_URL="https://github.com/chamizotec/commitia"
+REPO_RAW_URL="https://raw.githubusercontent.com/chamizotec/commitia/main"
 
 # Cores para output
 RED='\033[0;31m'
@@ -22,11 +24,8 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 BOLD='\033[1m'
 
-# Configurações padrão
+# Configurações padrão (serão aplicadas após carregar o config)
 CONFIG_FILE="${HOME}/.commitiarc"
-AI_PROVIDER="${COMMITIA_PROVIDER:-amp}"
-LANGUAGE="${COMMITIA_LANGUAGE:-pt}"
-AUTO_STAGE="${COMMITIA_AUTO_STAGE:-true}"
 DRY_RUN=false
 INTERACTIVE=false
 AMEND=false
@@ -62,6 +61,7 @@ print_help() {
   echo "  --no-stage               Não adiciona arquivos ao stage automaticamente"
   echo "  --provider <provider>    Define o provedor de IA (amp, openai, ollama)"
   echo "  --lang <idioma>          Idioma da mensagem (pt, en, es)"
+  echo "  --update                 Atualiza para a versão mais recente"
   echo "  -v, --version            Mostra a versão"
   echo "  -h, --help               Mostra esta ajuda"
   echo ""
@@ -166,14 +166,102 @@ check_unstaged_changes() {
 }
 
 # ============================================================================
+# Atualização
+# ============================================================================
+
+do_update() {
+  print_banner
+  info "Verificando atualizações..."
+  
+  # Verifica se curl está disponível
+  if ! command -v curl &>/dev/null; then
+    error "curl é necessário para atualização. Instale o curl primeiro."
+  fi
+  
+  # Cria diretório temporário
+  local temp_dir
+  temp_dir=$(mktemp -d)
+  trap "rm -rf $temp_dir" EXIT
+  
+  # Baixa a versão remota para verificar
+  info "Baixando informações da versão mais recente..."
+  local remote_script="$temp_dir/commitia"
+  
+  if ! curl -fsSL "$REPO_RAW_URL/bin/commitia" -o "$remote_script" 2>/dev/null; then
+    error "Não foi possível conectar ao repositório. Verifique sua conexão."
+  fi
+  
+  # Extrai versão remota
+  local remote_version
+  remote_version=$(grep -m1 '^VERSION=' "$remote_script" | cut -d'"' -f2)
+  
+  if [ -z "$remote_version" ]; then
+    error "Não foi possível determinar a versão remota"
+  fi
+  
+  echo ""
+  echo -e "  Versão atual:  ${YELLOW}$VERSION${NC}"
+  echo -e "  Versão remota: ${GREEN}$remote_version${NC}"
+  echo ""
+  
+  # Compara versões
+  if [ "$VERSION" = "$remote_version" ]; then
+    success "Você já está na versão mais recente!"
+    exit 0
+  fi
+  
+  # Pergunta se quer atualizar
+  echo -e "${YELLOW}Deseja atualizar para a versão $remote_version? [S/n]${NC}"
+  read -r -n 1 response
+  echo ""
+  
+  if [[ $response =~ ^[Nn]$ ]]; then
+    info "Atualização cancelada"
+    exit 0
+  fi
+  
+  # Determina o diretório de instalação
+  local install_dir
+  local current_script
+  current_script=$(command -v commitia 2>/dev/null || echo "$HOME/.local/bin/commitia")
+  install_dir=$(dirname "$current_script")
+  
+  # Faz backup do script atual
+  info "Criando backup..."
+  cp "$current_script" "$temp_dir/commitia.backup" 2>/dev/null || true
+  
+  # Instala a nova versão
+  info "Instalando versão $remote_version..."
+  
+  if cp "$remote_script" "$current_script" && chmod +x "$current_script"; then
+    success "Atualizado com sucesso para a versão $remote_version!"
+    echo ""
+    echo -e "${CYAN}Novidades: ${REPO_URL}/releases${NC}"
+  else
+    # Tenta restaurar backup
+    warn "Falha na atualização. Restaurando versão anterior..."
+    cp "$temp_dir/commitia.backup" "$current_script" 2>/dev/null || true
+    error "Não foi possível atualizar. Verifique as permissões."
+  fi
+}
+
+# ============================================================================
 # Carrega configuração
 # ============================================================================
 
 load_config() {
+  # Carrega o arquivo de configuração se existir
   if [ -f "$CONFIG_FILE" ]; then
     # shellcheck source=/dev/null
     source "$CONFIG_FILE"
   fi
+  
+  # Aplica valores padrão APÓS carregar o config
+  # Prioridade: default < config < linha de comando
+  # Se não foi definido via linha de comando, usa config ou default
+  AI_PROVIDER="${CLI_PROVIDER:-${COMMITIA_PROVIDER:-amp}}"
+  LANGUAGE="${CLI_LANGUAGE:-${COMMITIA_LANGUAGE:-pt}}"
+  AUTO_STAGE="${CLI_AUTO_STAGE:-${COMMITIA_AUTO_STAGE:-true}}"
 }
 
 # ============================================================================
@@ -330,6 +418,11 @@ main() {
   FORCED_TYPE=""
   FORCED_SCOPE=""
   
+  # Variáveis CLI (prioridade sobre config)
+  CLI_PROVIDER=""
+  CLI_LANGUAGE=""
+  CLI_AUTO_STAGE=""
+  
   while [[ $# -gt 0 ]]; do
     case $1 in
       -h|--help)
@@ -338,6 +431,10 @@ main() {
         ;;
       -v|--version)
         print_version
+        exit 0
+        ;;
+      --update)
+        do_update
         exit 0
         ;;
       -m|--message)
@@ -365,15 +462,15 @@ main() {
         shift
         ;;
       --no-stage)
-        AUTO_STAGE=false
+        CLI_AUTO_STAGE=false
         shift
         ;;
       --provider)
-        AI_PROVIDER="$2"
+        CLI_PROVIDER="$2"
         shift 2
         ;;
       --lang)
-        LANGUAGE="$2"
+        CLI_LANGUAGE="$2"
         shift 2
         ;;
       -*)

@@ -52,14 +52,14 @@ ollama pull codellama
 #### Instalação Rápida
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/seu-usuario/commitia/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/chamizotec/commitia/main/install.sh | bash
 ```
 
 #### Instalação Manual
 
 ```bash
 # Clone o repositório
-git clone https://github.com/seu-usuario/commitia.git
+git clone https://github.com/chamizotec/commitia.git
 cd commitia
 
 # Execute o instalador
@@ -182,5 +182,5 @@ chmod +x ~/.local/bin/commitia
 ## Suporte
 
 Se encontrar problemas, abra uma issue em:
-https://github.com/seu-usuario/commitia/issues
+https://github.com/chamizotec/commitia/issues
 

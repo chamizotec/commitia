@@ -174,7 +174,7 @@ CommitIA detecta automaticamente IDs de tarefas da sua branch:
 
 ```bash
 # Clone o repositório
-git clone https://github.com/seu-usuario/commitia.git
+git clone https://github.com/chamizotec/commitia.git
 cd commitia
 
 # Teste localmente

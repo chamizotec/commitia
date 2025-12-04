@@ -16,7 +16,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # Configurações
-REPO_URL="https://github.com/seu-usuario/commitia"
+REPO_URL="https://github.com/chamizotec/commitia"
 INSTALL_DIR="${COMMITIA_INSTALL_DIR:-$HOME/.local/bin}"
 SCRIPT_NAME="commitia"
 
