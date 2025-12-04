@@ -391,24 +391,24 @@ generate_with_ollama() {
     model="codellama"
   fi
   
-  # Prompt mais específico para modelos locais
-  local full_prompt="Você é um gerador de mensagens de commit Git.
-Analise o diff abaixo e gere UMA mensagem de commit seguindo o padrão Conventional Commits.
+  # Usa o prompt original (que já contém task_id/escopo) + instruções extras para modelos locais
+  local full_prompt="Você é um gerador de mensagens de commit Git. Siga EXATAMENTE as instruções abaixo.
 
-FORMATO OBRIGATÓRIO: tipo(escopo): descrição curta
+INSTRUÇÕES (SIGA COM PRECISÃO):
+$prompt
 
-TIPOS VÁLIDOS: feat, fix, docs, style, refactor, test, chore, perf, ci, build, revert
-
-REGRAS:
-- Descrição deve começar com letra minúscula
-- Não usar ponto final
-- Ser conciso (máximo 72 caracteres)
-- Retornar APENAS a mensagem, sem explicações
+REGRAS OBRIGATÓRIAS:
+1. FORMATO EXATO: tipo(escopo): descrição
+2. O ESCOPO deve ser EXATAMENTE o que foi especificado nas instruções acima (NÃO use o nome do arquivo)
+3. Descrição deve começar com letra MINÚSCULA
+4. NÃO usar ponto final
+5. Máximo 72 caracteres
+6. Retorne APENAS a mensagem, NADA MAIS
 
 DIFF:
 $diff
 
-MENSAGEM DE COMMIT:"
+RESPOSTA (apenas a mensagem de commit):"
 
   # Usa a API REST do Ollama
   local json_payload
