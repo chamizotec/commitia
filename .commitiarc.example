@@ -1,0 +1,50 @@
+# ============================================================================
+# CommitIA - Arquivo de Configuração
+# ============================================================================
+# Copie este arquivo para ~/.commitiarc e ajuste conforme necessário.
+# Todas as configurações também podem ser definidas via variáveis de ambiente.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Provedor de IA
+# ----------------------------------------------------------------------------
+# Opções: amp, openai, ollama
+# Padrão: amp
+#
+# COMMITIA_PROVIDER="amp"
+
+# ----------------------------------------------------------------------------
+# Idioma das mensagens de commit
+# ----------------------------------------------------------------------------
+# Opções: pt (português), en (inglês), es (espanhol)
+# Padrão: pt
+#
+# COMMITIA_LANGUAGE="pt"
+
+# ----------------------------------------------------------------------------
+# Auto-stage
+# ----------------------------------------------------------------------------
+# Se true, adiciona arquivos ao stage automaticamente antes de gerar o commit.
+# Se false, espera que os arquivos já estejam no stage.
+# Padrão: true
+#
+# COMMITIA_AUTO_STAGE="true"
+
+# ----------------------------------------------------------------------------
+# Configurações específicas de provedores
+# ----------------------------------------------------------------------------
+
+# OpenAI
+# ------
+# Configure sua API key como variável de ambiente:
+# export OPENAI_API_KEY="sk-..."
+
+# Ollama
+# ------
+# Certifique-se de que o Ollama está rodando e tem o modelo codellama:
+# ollama pull codellama
+
+# amp CLI
+# -------
+# Instale o amp CLI seguindo as instruções em: https://ampcode.com
+
