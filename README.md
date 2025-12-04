@@ -29,7 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/chamizotec/commitia/refs/heads/main
 
 ```bash
 # Clone o repositório
-git clone https://github.com/seu-usuario/commitia.git
+git clone https://github.com/chamizotec/commitia.git
 cd commitia
 
 # Execute o instalador
