@@ -113,7 +113,14 @@ commitia -a
 
 ## ⚙️ Configuração
 
-### Arquivo de configuração
+### Ordem de prioridade
+
+1. **Linha de comando** (maior prioridade): `--provider`, `--lang`
+2. **Projeto**: `.commitiarc` na raiz do repositório
+3. **Global**: `~/.commitiarc`
+4. **Padrão** (menor prioridade): amp, pt, true
+
+### Configuração global
 
 Crie `~/.commitiarc`:
 
@@ -126,6 +133,16 @@ COMMITIA_LANGUAGE="pt"
 
 # Adicionar arquivos ao stage automaticamente
 COMMITIA_AUTO_STAGE="true"
+```
+
+### Configuração por projeto
+
+Crie `.commitiarc` na raiz do seu projeto para configurações específicas:
+
+```bash
+# Exemplo: projeto internacional em inglês usando OpenAI
+COMMITIA_PROVIDER="openai"
+COMMITIA_LANGUAGE="en"
 ```
 
 ### Variáveis de ambiente

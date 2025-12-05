@@ -1,1 +1,8 @@
+# Configuração do projeto CommitIA
+# Este arquivo é usado como exemplo e para desenvolvimento
+
+# Provedor de IA para desenvolvimento
 COMMITIA_PROVIDER="ollama"
+
+# Idioma padrão
+COMMITIA_LANGUAGE="pt"

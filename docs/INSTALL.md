@@ -78,6 +78,7 @@ COMMITIA_INSTALL_DIR=/usr/local/bin ./install.sh
 O CommitIA funciona no Windows através do WSL (Windows Subsystem for Linux).
 
 1. Instale o WSL:
+
    ```powershell
    wsl --install
    ```
@@ -183,4 +184,3 @@ chmod +x ~/.local/bin/commitia
 
 Se encontrar problemas, abra uma issue em:
 https://github.com/chamizotec/commitia/issues
-
