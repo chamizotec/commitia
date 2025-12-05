@@ -89,10 +89,14 @@ print_help() {
   echo "  revert    Reversão de commit anterior"
   echo ""
   echo -e "${BOLD}CONFIGURAÇÃO:${NC}"
-  echo "  Crie ~/.commitiarc ou defina variáveis de ambiente:"
-  echo "  - COMMITIA_PROVIDER: amp, openai, ollama (padrão: amp)"
-  echo "  - COMMITIA_LANGUAGE: pt, en, es (padrão: pt)"
-  echo "  - COMMITIA_AUTO_STAGE: true, false (padrão: true)"
+  echo "  Arquivos de configuração (ordem de prioridade):"
+  echo "    1. .commitiarc na raiz do projeto (maior prioridade)"
+  echo "    2. ~/.commitiarc (global)"
+  echo ""
+  echo "  Variáveis disponíveis:"
+  echo "    - COMMITIA_PROVIDER: amp, openai, ollama (padrão: amp)"
+  echo "    - COMMITIA_LANGUAGE: pt, en, es (padrão: pt)"
+  echo "    - COMMITIA_AUTO_STAGE: true, false (padrão: true)"
   echo ""
 }
 
@@ -264,18 +268,43 @@ do_update() {
 # ============================================================================
 
 load_config() {
-  # Carrega o arquivo de configuração se existir
+  # Prioridade de configuração:
+  # 1. Valores padrão (menor prioridade)
+  # 2. ~/.commitiarc (global)
+  # 3. .commitiarc na raiz do projeto (local)
+  # 4. Linha de comando (maior prioridade)
+  
+  # Carrega configuração global se existir
   if [ -f "$CONFIG_FILE" ]; then
     # shellcheck source=/dev/null
     source "$CONFIG_FILE"
   fi
   
-  # Aplica valores padrão APÓS carregar o config
-  # Prioridade: default < config < linha de comando
+  # Carrega configuração local do projeto (sobrescreve global)
+  local project_config
+  project_config=$(get_project_config_file)
+  
+  if [ -n "$project_config" ] && [ -f "$project_config" ]; then
+    info "Usando configuração do projeto: $project_config"
+    # shellcheck source=/dev/null
+    source "$project_config"
+  fi
+  
+  # Aplica valores padrão APÓS carregar os configs
   # Se não foi definido via linha de comando, usa config ou default
   AI_PROVIDER="${CLI_PROVIDER:-${COMMITIA_PROVIDER:-amp}}"
   LANGUAGE="${CLI_LANGUAGE:-${COMMITIA_LANGUAGE:-pt}}"
   AUTO_STAGE="${CLI_AUTO_STAGE:-${COMMITIA_AUTO_STAGE:-true}}"
+}
+
+# Encontra o arquivo de configuração do projeto (na raiz do repositório Git)
+get_project_config_file() {
+  local git_root
+  git_root=$(git rev-parse --show-toplevel 2>/dev/null)
+  
+  if [ -n "$git_root" ] && [ -f "$git_root/.commitiarc" ]; then
+    echo "$git_root/.commitiarc"
+  fi
 }
 
 # ============================================================================

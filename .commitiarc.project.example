@@ -1,0 +1,45 @@
+# ============================================================================
+# CommitIA - Configuração do Projeto
+# ============================================================================
+# Coloque este arquivo como .commitiarc na raiz do seu projeto Git.
+# As configurações aqui sobrescrevem o ~/.commitiarc global.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Provedor de IA
+# ----------------------------------------------------------------------------
+# Opções: amp, openai, ollama
+# Use para forçar um provedor específico no projeto
+#
+# COMMITIA_PROVIDER="openai"
+
+# ----------------------------------------------------------------------------
+# Idioma das mensagens de commit
+# ----------------------------------------------------------------------------
+# Opções: pt (português), en (inglês), es (espanhol)
+# Útil para projetos internacionais que exigem commits em inglês
+#
+# COMMITIA_LANGUAGE="en"
+
+# ----------------------------------------------------------------------------
+# Auto-stage
+# ----------------------------------------------------------------------------
+# Se true, adiciona arquivos ao stage automaticamente antes de gerar o commit.
+# Se false, espera que os arquivos já estejam no stage.
+#
+# COMMITIA_AUTO_STAGE="true"
+
+# ============================================================================
+# EXEMPLO DE USO
+# ============================================================================
+# 
+# Projeto em inglês usando OpenAI:
+#   COMMITIA_PROVIDER="openai"
+#   COMMITIA_LANGUAGE="en"
+#
+# Projeto usando modelo local (Ollama):
+#   COMMITIA_PROVIDER="ollama"
+#   COMMITIA_LANGUAGE="pt"
+#
+# ============================================================================
+
