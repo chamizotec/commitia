@@ -216,6 +216,10 @@ cd commitia
 ./tests/run_tests.sh
 ```
 
+## 📌 Versão e releases
+
+A versão fica em `bin/commitia` (variável `VERSION`). Ao fazer **push na branch `main`**, um [GitHub Action](.github/workflows/bump-version.yml) incrementa automaticamente o **patch** (ex.: `1.0.9` → `1.0.10`), faz commit e push do bump. Commits cuja mensagem já for um bump de versão são ignorados para evitar loop.
+
 ## 🤝 Contribuindo
 
 Contribuições são bem-vindas! Por favor, leia o [CONTRIBUTING.md](CONTRIBUTING.md) antes de enviar um PR.

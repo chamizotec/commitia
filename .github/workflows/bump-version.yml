@@ -1,0 +1,60 @@
+# Incrementa a versão automaticamente ao fazer push na main.
+# Evita loop ignorando commits cuja mensagem já é um bump de versão.
+
+name: Bump version on push to main
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Evitar loop (pular se último commit já for bump)
+        id: skip
+        run: |
+          LAST_MSG=$(git log -1 --pretty=%B)
+          if echo "$LAST_MSG" | grep -qE '^(chore|ci)(\([^)]*\))?: bump version to'; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "Último commit já é bump de versão, ignorando."
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Obter versão atual e incrementar patch
+        if: steps.skip.outputs.skip != 'true'
+        id: version
+        run: |
+          CURRENT=$(grep -m1 '^VERSION=' bin/commitia | sed 's/VERSION="\(.*\)"/\1/')
+          MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+          MINOR=$(echo "$CURRENT" | cut -d. -f2)
+          PATCH=$(echo "$CURRENT" | cut -d. -f3)
+          PATCH=$((PATCH + 1))
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          echo "new=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "Versão atual: $CURRENT → Nova: $NEW_VERSION"
+
+      - name: Atualizar VERSION em bin/commitia
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          sed -i "s/^VERSION=\"${{ steps.version.outputs.current }}\"/VERSION=\"${{ steps.version.outputs.new }}\"/" bin/commitia
+          grep '^VERSION=' bin/commitia
+
+      - name: Commit e push do bump
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bin/commitia
+          git commit -m "chore: bump version to ${{ steps.version.outputs.new }}"
+          git push

@@ -31,9 +31,36 @@ INTERACTIVE=false
 AMEND=false
 FORCE_UPDATE=false
 
+# jq disponível? (fallback para grep/sed quando não instalado)
+HAS_JQ=false
+command -v jq &>/dev/null && HAS_JQ=true
+
 # ============================================================================
 # Funções de utilidade
 # ============================================================================
+
+# Escapa string para uso dentro de JSON (quando jq não está disponível)
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+# Extrai campo de texto de respostas JSON (fallback quando sem jq)
+# Uso: parse_json_response "$response" "content"  ou "text" ou "response"
+# Limitação: mensagens com aspas duplas podem ser cortadas; use jq para conteúdo complexo
+parse_json_response() {
+  local response="$1"
+  local field="$2"
+  # Remove prefixo até "field":", depois remove ", ou "} e o restante (fim do valor JSON)
+  echo "$response" | sed "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"//" | \
+    sed 's/"[[:space:]]*,[[:space:]]*.*$//; s/"[[:space:]]*}.*$//; s/"[[:space:]]*$//' | \
+    sed 's/\\n/\n/g' | sed 's/\\"/"/g'
+}
 
 print_banner() {
   echo -e "${PURPLE}"
@@ -145,16 +172,16 @@ check_dependencies() {
       if ! command -v curl &>/dev/null; then
         error "curl não encontrado"
       fi
-      if ! command -v jq &>/dev/null; then
-        error "jq não encontrado. Instale com: brew install jq"
+      if [ "$HAS_JQ" = false ]; then
+        warn "jq não encontrado; usando grep/sed (recomendado: brew install jq)"
       fi
       ;;
     ollama)
       if ! command -v ollama &>/dev/null; then
         error "Ollama não encontrado. Instale em: https://ollama.ai"
       fi
-      if ! command -v jq &>/dev/null; then
-        error "jq não encontrado. Instale com: brew install jq"
+      if [ "$HAS_JQ" = false ]; then
+        warn "jq não encontrado; usando grep/sed (recomendado: brew install jq)"
       fi
       ;;
     gemini)
@@ -164,8 +191,8 @@ check_dependencies() {
       if ! command -v curl &>/dev/null; then
         error "curl não encontrado"
       fi
-      if ! command -v jq &>/dev/null; then
-        error "jq não encontrado. Instale com: brew install jq"
+      if [ "$HAS_JQ" = false ]; then
+        warn "jq não encontrado; usando grep/sed (recomendado: brew install jq)"
       fi
       ;;
     *)
@@ -396,19 +423,27 @@ generate_with_openai() {
   local diff
   diff=$(get_staged_diff)
   
-  # Cria o JSON usando jq para escapar corretamente
+  local user_content="${prompt}"$'\n\n'"Diff:"$'\n'"${diff}"
+  local sys_content="Você é um assistente especializado em gerar mensagens de commit seguindo Conventional Commits."
+  
   local json_payload
-  json_payload=$(jq -n \
-    --arg prompt "$prompt" \
-    --arg diff "$diff" \
-    '{
-      model: "gpt-4o-mini",
-      messages: [
-        {role: "system", content: "Você é um assistente especializado em gerar mensagens de commit seguindo Conventional Commits."},
-        {role: "user", content: ($prompt + "\n\nDiff:\n" + $diff)}
-      ],
-      temperature: 0.3
-    }')
+  if [ "$HAS_JQ" = true ]; then
+    json_payload=$(jq -n \
+      --arg prompt "$prompt" \
+      --arg diff "$diff" \
+      '{
+        model: "gpt-4o-mini",
+        messages: [
+          {role: "system", content: "Você é um assistente especializado em gerar mensagens de commit seguindo Conventional Commits."},
+          {role: "user", content: ($prompt + "\n\nDiff:\n" + $diff)}
+        ],
+        temperature: 0.3
+      }')
+  else
+    json_payload=$(printf '{"model":"gpt-4o-mini","messages":[{"role":"system","content":"%s"},{"role":"user","content":"%s"}],"temperature":0.3}' \
+      "$(json_escape "$sys_content")" \
+      "$(json_escape "$user_content")")
+  fi
   
   local response
   response=$(curl -s https://api.openai.com/v1/chat/completions \
@@ -416,8 +451,11 @@ generate_with_openai() {
     -H "Authorization: Bearer $OPENAI_API_KEY" \
     -d "$json_payload")
   
-  # Extrai o conteúdo da resposta
-  echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null
+  if [ "$HAS_JQ" = true ]; then
+    echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null
+  else
+    parse_json_response "$response" "content"
+  fi
 }
 
 generate_with_gemini() {
@@ -426,34 +464,34 @@ generate_with_gemini() {
   diff=$(get_staged_diff)
   
   # API Gemini: https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
-  # Modelo: gemini-2.0-flash ou gemini-1.5-flash (mais estável)
   local model="${COMMITIA_GEMINI_MODEL:-gemini-2.0-flash}"
+  local text_content="${prompt}"$'\n\n'"Diff:"$'\n'"${diff}"
   
   local json_payload
-  json_payload=$(jq -n \
-    --arg prompt "$prompt" \
-    --arg diff "$diff" \
-    '{
-      contents: [
-        {
-          parts: [
-            { text: ($prompt + "\n\nDiff:\n" + $diff) }
-          ]
-        }
-      ],
-      generationConfig: {
-        temperature: 0.3,
-        maxOutputTokens: 256
-      }
-    }')
+  if [ "$HAS_JQ" = true ]; then
+    json_payload=$(jq -n \
+      --arg prompt "$prompt" \
+      --arg diff "$diff" \
+      '{
+        contents: [{ parts: [{ text: ($prompt + "\n\nDiff:\n" + $diff) }] }],
+        generationConfig: { temperature: 0.3, maxOutputTokens: 256 }
+      }')
+  else
+    json_payload=$(printf '{"contents":[{"parts":[{"text":"%s"}]}],"generationConfig":{"temperature":0.3,"maxOutputTokens":256}}' \
+      "$(json_escape "$text_content")")
+  fi
   
   local response
   response=$(curl -s "https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}" \
     -H "Content-Type: application/json" \
     -d "$json_payload")
   
-  # Resposta: .candidates[0].content.parts[0].text
-  echo "$response" | jq -r '.candidates[0].content.parts[0].text // empty' 2>/dev/null
+  if [ "$HAS_JQ" = true ]; then
+    echo "$response" | jq -r '.candidates[0].content.parts[0].text // empty' 2>/dev/null
+  else
+    # Gemini retorna o texto em candidates[0].content.parts[0].text -> campo "text"
+    parse_json_response "$response" "text"
+  fi
 }
 
 generate_with_ollama() {
@@ -488,22 +526,27 @@ RESPOSTA (apenas a mensagem de commit):"
 
   # Usa a API REST do Ollama
   local json_payload
-  json_payload=$(jq -n \
-    --arg model "$model" \
-    --arg prompt "$full_prompt" \
-    '{
-      model: $model,
-      prompt: $prompt,
-      stream: false
-    }')
+  if [ "$HAS_JQ" = true ]; then
+    json_payload=$(jq -n \
+      --arg model "$model" \
+      --arg prompt "$full_prompt" \
+      '{ model: $model, prompt: $prompt, stream: false }')
+  else
+    json_payload=$(printf '{"model":"%s","prompt":"%s","stream":false}' \
+      "$model" \
+      "$(json_escape "$full_prompt")")
+  fi
   
   local response
   response=$(curl -s http://localhost:11434/api/generate \
     -H "Content-Type: application/json" \
     -d "$json_payload")
   
-  # Extrai a resposta
-  echo "$response" | jq -r '.response // empty' 2>/dev/null
+  if [ "$HAS_JQ" = true ]; then
+    echo "$response" | jq -r '.response // empty' 2>/dev/null
+  else
+    parse_json_response "$response" "response"
+  fi
 }
 
 generate_commit_message() {
