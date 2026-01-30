@@ -232,11 +232,13 @@ Para, ao fazer push na main, já trazer o commit de bump gerado pelo CI:
 
 **Opção 2 – Alias no Git (só na main)**
 
+Inclui um delay (10s) entre push e pull para dar tempo do CI rodar:
+
 ```bash
-git config alias.pushmain '!git push origin main && git pull'
+git config alias.pushmain '!git push origin main && echo "Aguardando CI (10s)..." && sleep 10 && git pull'
 ```
 
-Depois use: `git pushmain` quando estiver na branch `main`.
+Depois use: `git pushmain` quando estiver na branch `main`. Para outro delay, troque `sleep 10` por `sleep 15`, etc.
 
 ## 🤝 Contribuindo
 
