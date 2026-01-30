@@ -220,6 +220,24 @@ cd commitia
 
 A versão fica em `bin/commitia` (variável `VERSION`). Ao fazer **push na branch `main`**, um [GitHub Action](.github/workflows/bump-version.yml) incrementa automaticamente o **patch** (ex.: `1.0.9` → `1.0.10`), faz commit e push do bump. Commits cuja mensagem já for um bump de versão são ignorados para evitar loop.
 
+### Automação local: push + pull
+
+Para, ao fazer push na main, já trazer o commit de bump gerado pelo CI:
+
+**Opção 1 – Script no repositório**
+
+```bash
+./scripts/push-main.sh
+```
+
+**Opção 2 – Alias no Git (só na main)**
+
+```bash
+git config alias.pushmain '!git push origin main && git pull'
+```
+
+Depois use: `git pushmain` quando estiver na branch `main`.
+
 ## 🤝 Contribuindo
 
 Contribuições são bem-vindas! Por favor, leia o [CONTRIBUTING.md](CONTRIBUTING.md) antes de enviar um PR.
