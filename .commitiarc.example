@@ -8,7 +8,7 @@
 # ----------------------------------------------------------------------------
 # Provedor de IA
 # ----------------------------------------------------------------------------
-# Opções: amp, openai, ollama
+# Opções: amp, openai, gemini, ollama
 # Padrão: amp
 #
 # COMMITIA_PROVIDER="amp"
@@ -38,6 +38,13 @@
 # ------
 # Configure sua API key como variável de ambiente:
 # export OPENAI_API_KEY="sk-..."
+
+# Gemini (Google)
+# ---------------
+# Obtenha a chave em: https://aistudio.google.com/apikey
+# export GEMINI_API_KEY="sua-chave"
+# Modelo opcional (padrão: gemini-2.0-flash):
+# COMMITIA_GEMINI_MODEL="gemini-1.5-flash"
 
 # Ollama
 # ------

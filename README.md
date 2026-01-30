@@ -168,6 +168,21 @@ export OPENAI_API_KEY="sk-..."
 commitia --provider openai
 ```
 
+### Gemini (Google)
+
+Obtenha uma API key em [Google AI Studio](https://aistudio.google.com/apikey) e configure:
+
+```bash
+export GEMINI_API_KEY="sua-chave"
+commitia --provider gemini
+```
+
+Opcionalmente defina o modelo no `.commitiarc` ou via variável de ambiente:
+
+```bash
+COMMITIA_GEMINI_MODEL="gemini-1.5-flash"  # ou gemini-2.0-flash (padrão)
+```
+
 ### Ollama
 
 Instale o [Ollama](https://ollama.ai) e baixe um modelo:

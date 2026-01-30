@@ -97,6 +97,11 @@ check_dependencies() {
     has_provider=true
   fi
   
+  if [ -n "$GEMINI_API_KEY" ]; then
+    success "Gemini API key configurada"
+    has_provider=true
+  fi
+  
   if command -v ollama &>/dev/null; then
     success "Ollama encontrado"
     has_provider=true
@@ -109,6 +114,7 @@ check_dependencies() {
     echo "Instale pelo menos um dos seguintes:"
     echo "  • amp CLI: https://ampcode.com"
     echo "  • OpenAI: Configure OPENAI_API_KEY"
+    echo "  • Gemini: Configure GEMINI_API_KEY (https://aistudio.google.com/apikey)"
     echo "  • Ollama: https://ollama.ai"
     echo ""
     

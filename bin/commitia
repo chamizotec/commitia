@@ -60,7 +60,7 @@ print_help() {
   echo "  -d, --dry-run            Apenas mostra a mensagem sem fazer commit"
   echo "  -a, --amend              Altera o último commit"
   echo "  --no-stage               Não adiciona arquivos ao stage automaticamente"
-  echo "  --provider <provider>    Define o provedor de IA (amp, openai, ollama)"
+  echo "  --provider <provider>    Define o provedor de IA (amp, openai, gemini, ollama)"
   echo "  --lang <idioma>          Idioma da mensagem (pt, en, es)"
   echo "  --update                 Atualiza para a versão mais recente"
   echo "  --force                  Força atualização (usar com --update)"
@@ -94,7 +94,7 @@ print_help() {
   echo "    2. ~/.commitiarc (global)"
   echo ""
   echo "  Variáveis disponíveis:"
-  echo "    - COMMITIA_PROVIDER: amp, openai, ollama (padrão: amp)"
+  echo "    - COMMITIA_PROVIDER: amp, openai, gemini, ollama (padrão: amp)"
   echo "    - COMMITIA_LANGUAGE: pt, en, es (padrão: pt)"
   echo "    - COMMITIA_AUTO_STAGE: true, false (padrão: true)"
   echo ""
@@ -152,6 +152,17 @@ check_dependencies() {
     ollama)
       if ! command -v ollama &>/dev/null; then
         error "Ollama não encontrado. Instale em: https://ollama.ai"
+      fi
+      if ! command -v jq &>/dev/null; then
+        error "jq não encontrado. Instale com: brew install jq"
+      fi
+      ;;
+    gemini)
+      if [ -z "$GEMINI_API_KEY" ]; then
+        error "GEMINI_API_KEY não definida. Obtenha em: https://aistudio.google.com/apikey"
+      fi
+      if ! command -v curl &>/dev/null; then
+        error "curl não encontrado"
       fi
       if ! command -v jq &>/dev/null; then
         error "jq não encontrado. Instale com: brew install jq"
@@ -409,6 +420,42 @@ generate_with_openai() {
   echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null
 }
 
+generate_with_gemini() {
+  local prompt="$1"
+  local diff
+  diff=$(get_staged_diff)
+  
+  # API Gemini: https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
+  # Modelo: gemini-2.0-flash ou gemini-1.5-flash (mais estável)
+  local model="${COMMITIA_GEMINI_MODEL:-gemini-2.0-flash}"
+  
+  local json_payload
+  json_payload=$(jq -n \
+    --arg prompt "$prompt" \
+    --arg diff "$diff" \
+    '{
+      contents: [
+        {
+          parts: [
+            { text: ($prompt + "\n\nDiff:\n" + $diff) }
+          ]
+        }
+      ],
+      generationConfig: {
+        temperature: 0.3,
+        maxOutputTokens: 256
+      }
+    }')
+  
+  local response
+  response=$(curl -s "https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}" \
+    -H "Content-Type: application/json" \
+    -d "$json_payload")
+  
+  # Resposta: .candidates[0].content.parts[0].text
+  echo "$response" | jq -r '.candidates[0].content.parts[0].text // empty' 2>/dev/null
+}
+
 generate_with_ollama() {
   local prompt="$1"
   local diff
@@ -469,6 +516,9 @@ generate_commit_message() {
       ;;
     openai)
       output=$(generate_with_openai "$prompt")
+      ;;
+    gemini)
+      output=$(generate_with_gemini "$prompt")
       ;;
     ollama)
       output=$(generate_with_ollama "$prompt")
