@@ -37,6 +37,8 @@ command -v jq &>/dev/null && HAS_JQ=true
 
 # Output bruto do provedor de IA (para log em caso de erro)
 COMMITIA_RAW_OUTPUT=""
+# Saída de erro do git commit quando o commit falha (hooks, validação, etc.)
+COMMITIA_COMMIT_STDERR=""
 
 # ============================================================================
 # Log de erros
@@ -89,6 +91,43 @@ write_error_log() {
     echo ""
     echo "--- Resposta bruta do provedor de IA ---"
     echo "$raw_output"
+    echo ""
+    echo "--- Fim do log ---"
+  } > "$log_file"
+  
+  echo "$log_file"
+}
+
+# Grava log quando o commit é rejeitado (ex.: commitlint, husky, hooks)
+write_commit_failure_log() {
+  local commit_msg="$1"
+  local git_stderr="$2"
+  local staged_files="$3"
+  local branch="$4"
+  
+  local log_dir
+  log_dir=$(get_log_dir)
+  mkdir -p "$log_dir"
+  
+  local log_file
+  log_file="${log_dir}/commitia-error-$(date +%Y%m%d-%H%M%S).log"
+  
+  {
+    echo "=============================================="
+    echo "CommitIA - Log de erro: falha ao realizar commit"
+    echo "=============================================="
+    echo "Data/Hora: $(date -Iseconds 2>/dev/null || date)"
+    echo "Provedor:  $AI_PROVIDER"
+    echo "Branch:    ${branch:- (não em repo git)}"
+    echo ""
+    echo "--- Mensagem de commit tentada ---"
+    echo "$commit_msg"
+    echo ""
+    echo "--- Arquivos no stage ---"
+    echo "$staged_files"
+    echo ""
+    echo "--- Saída de erro do git commit ---"
+    echo "$git_stderr"
     echo ""
     echo "--- Fim do log ---"
   } > "$log_file"
@@ -658,13 +697,24 @@ generate_commit_message() {
 do_commit() {
   local message="$1"
   local amend_flag=""
+  local tmp_stderr
+  
+  COMMITIA_COMMIT_STDERR=""
   
   if [ "$AMEND" = true ]; then
     amend_flag="--amend"
   fi
   
+  tmp_stderr=$(mktemp)
   # shellcheck disable=SC2086
-  git commit $amend_flag -m "$message"
+  set +e
+  git commit $amend_flag -m "$message" 2>"$tmp_stderr"
+  local ret=$?
+  set -e
+  COMMITIA_COMMIT_STDERR=$(cat "$tmp_stderr" 2>/dev/null)
+  rm -f "$tmp_stderr"
+  
+  return $ret
 }
 
 # ============================================================================
@@ -853,7 +903,15 @@ main() {
     clear_error_logs
     success "Commit realizado: $COMMIT_MSG"
   else
-    error "Falha ao realizar commit"
+    LOG_PATH=$(write_commit_failure_log \
+      "$COMMIT_MSG" \
+      "$COMMITIA_COMMIT_STDERR" \
+      "$(get_staged_files)" \
+      "$(git branch --show-current 2>/dev/null || echo '')")
+    echo ""
+    echo -e "${RED}✗ Erro: Falha ao realizar commit${NC}" >&2
+    echo -e "  Log gravado em: ${BOLD}$LOG_PATH${NC}" >&2
+    exit 1
   fi
 }
 
