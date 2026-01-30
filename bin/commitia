@@ -35,6 +35,74 @@ FORCE_UPDATE=false
 HAS_JQ=false
 command -v jq &>/dev/null && HAS_JQ=true
 
+# Output bruto do provedor de IA (para log em caso de erro)
+COMMITIA_RAW_OUTPUT=""
+
+# ============================================================================
+# Log de erros
+# ============================================================================
+
+# Retorna o diretório de logs (.commitia/logs na raiz do repo ou ~/.commitia/logs)
+get_log_dir() {
+  local git_root
+  git_root=$(git rev-parse --show-toplevel 2>/dev/null)
+  if [ -n "$git_root" ]; then
+    echo "$git_root/.commitia/logs"
+  else
+    echo "${HOME}/.commitia/logs"
+  fi
+}
+
+# Cria o diretório de logs e grava arquivo com informações do erro
+write_error_log() {
+  local raw_output="$1"
+  local prompt="$2"
+  local diff_content="$3"
+  local staged_files="$4"
+  local branch="$5"
+  
+  local log_dir
+  log_dir=$(get_log_dir)
+  mkdir -p "$log_dir"
+  
+  local log_file
+  log_file="${log_dir}/commitia-error-$(date +%Y%m%d-%H%M%S).log"
+  
+  {
+    echo "=============================================="
+    echo "CommitIA - Log de erro na geração do commit"
+    echo "=============================================="
+    echo "Data/Hora: $(date -Iseconds 2>/dev/null || date)"
+    echo "Provedor:  $AI_PROVIDER"
+    echo "Branch:    ${branch:- (não em repo git)}"
+    echo ""
+    echo "--- Arquivos no stage ---"
+    echo "$staged_files"
+    echo ""
+    echo "--- Prompt enviado (início) ---"
+    echo "${prompt:0:2000}"
+    [ ${#prompt} -gt 2000 ] && echo "... [truncado]"
+    echo ""
+    echo "--- Diff (staged) ---"
+    echo "${diff_content:0:4000}"
+    [ ${#diff_content} -gt 4000 ] && echo "... [truncado]"
+    echo ""
+    echo "--- Resposta bruta do provedor de IA ---"
+    echo "$raw_output"
+    echo ""
+    echo "--- Fim do log ---"
+  } > "$log_file"
+  
+  echo "$log_file"
+}
+
+# Remove todos os arquivos de log da pasta de logs (após commit bem-sucedido)
+clear_error_logs() {
+  local log_dir
+  log_dir=$(get_log_dir)
+  [ -d "$log_dir" ] && rm -f "${log_dir}"/commitia-error-*.log 2>/dev/null || true
+}
+
 # ============================================================================
 # Funções de utilidade
 # ============================================================================
@@ -553,6 +621,8 @@ generate_commit_message() {
   local prompt="$1"
   local output
   
+  COMMITIA_RAW_OUTPUT=""
+  
   case "$AI_PROVIDER" in
     amp)
       output=$(generate_with_amp "$prompt")
@@ -567,6 +637,8 @@ generate_commit_message() {
       output=$(generate_with_ollama "$prompt")
       ;;
   esac
+  
+  COMMITIA_RAW_OUTPUT="$output"
   
   # Extrai a mensagem no formato correto
   local msg
@@ -732,7 +804,16 @@ main() {
   COMMIT_MSG=$(generate_commit_message "$PROMPT")
   
   if [ -z "$COMMIT_MSG" ]; then
-    error "Não foi possível gerar a mensagem de commit"
+    LOG_PATH=$(write_error_log \
+      "$COMMITIA_RAW_OUTPUT" \
+      "$PROMPT" \
+      "$(get_staged_diff)" \
+      "$(get_staged_files)" \
+      "$(git branch --show-current 2>/dev/null || echo '')")
+    echo ""
+    echo -e "${RED}✗ Erro: Não foi possível gerar a mensagem de commit${NC}" >&2
+    echo -e "  Log gravado em: ${BOLD}$LOG_PATH${NC}" >&2
+    exit 1
   fi
   
   echo ""
@@ -769,6 +850,7 @@ main() {
   
   # Realiza o commit
   if do_commit "$COMMIT_MSG"; then
+    clear_error_logs
     success "Commit realizado: $COMMIT_MSG"
   else
     error "Falha ao realizar commit"

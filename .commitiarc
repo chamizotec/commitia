@@ -2,7 +2,7 @@
 # Este arquivo é usado como exemplo e para desenvolvimento
 
 # Provedor de IA para desenvolvimento
-COMMITIA_PROVIDER="openai"
+COMMITIA_PROVIDER="gemini"
 
 export GEMINI_API_KEY="AIzaSyCbQbeQJXmFaD4sQjX5ezRimGLr6WfkaWw"
 export COMMITIA_GEMINI_MODEL="gemini-2.0-flash"
