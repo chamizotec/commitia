@@ -14,6 +14,7 @@ CommitIA analisa suas alterações no Git e gera automaticamente mensagens de co
 - 🔍 **Detecção de escopo** - Extrai automaticamente IDs de tarefas da branch (JIRA, etc.)
 - 🌍 **Multi-idioma** - Suporte para português, inglês e espanhol
 - 🤖 **Múltiplos provedores de IA** - Compatível com amp CLI, OpenAI, Gemini, Ollama e as CLIs do Cursor, GitHub Copilot, Claude Code, Codex e Gemini
+- 📦 **Arquivos grandes sem dor de cabeça** - Lockfiles (`pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`...) e diffs enormes são commitados separadamente, com fallback automático quando a IA falha
 - 🎨 **Interface amigável** - Cores, feedback claro e modo interativo
 - ⚡ **Rápido e leve** - Script bash sem dependências pesadas
 
@@ -118,7 +119,7 @@ commitia -a
 1. **Linha de comando** (maior prioridade): `--provider`, `--lang`
 2. **Projeto**: `.commitiarc` na raiz do repositório
 3. **Global**: `~/.commitiarc`
-4. **Padrão** (menor prioridade): amp, pt, true
+4. **Padrão** (menor prioridade): amp, pt, true (arquivos grandes: 1000 linhas / 100000 bytes)
 
 ### Configuração global
 
@@ -133,6 +134,11 @@ COMMITIA_LANGUAGE="pt"
 
 # Adicionar arquivos ao stage automaticamente
 COMMITIA_AUTO_STAGE="true"
+
+# Arquivos grandes (lockfiles e diffs enormes) em commits separados
+COMMITIA_LARGE_FILES="true"
+COMMITIA_LARGE_FILE_LINES="1000"
+COMMITIA_LARGE_FILE_BYTES="100000"
 ```
 
 ### Configuração por projeto
@@ -220,6 +226,48 @@ COMMITIA_CLAUDE_MODEL="sonnet"    # modelo (CURSOR, COPILOT, CLAUDE, CODEX, GEMI
 ```
 
 > O provedor `gemini` usa a API REST; `gemini-cli` usa a CLI `gemini`.
+
+## 📦 Arquivos grandes (lockfiles e diffs enormes)
+
+Lockfiles e arquivos com diff muito grande costumam estourar o limite da IA. O CommitIA os identifica no stage e os commita **separadamente**, sem você precisar fazer nada manualmente.
+
+### Como detecta
+
+Um arquivo do stage é considerado grande se **qualquer** critério for verdadeiro:
+
+- o nome casa com `COMMITIA_LARGE_FILE_PATTERNS` (por padrão, lockfiles conhecidos: `pnpm-lock.yaml`, `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `bun.lock`, `bun.lockb`, `composer.lock`, `Cargo.lock`, `poetry.lock`, `Pipfile.lock`, `Gemfile.lock`, `go.sum`, `mix.lock`, `pubspec.lock`, `Podfile.lock`, `Package.resolved`, `flake.lock`, `deno.lock`, `uv.lock`, `pdm.lock`, `*.lock`, `*-lock.json`, `*-lock.yaml`...);
+- o número de linhas alteradas (`git diff --staged --numstat`) é maior ou igual a `COMMITIA_LARGE_FILE_LINES`;
+- o tamanho do diff em bytes é maior ou igual a `COMMITIA_LARGE_FILE_BYTES`;
+- é um arquivo **binário** com tamanho maior ou igual a `COMMITIA_LARGE_FILE_BYTES` (binários grandes nunca têm o diff enviado à IA, apenas um resumo).
+
+### Fluxo
+
+1. Os arquivos **pequenos** são commitados primeiro (os grandes saem do stage temporariamente).
+2. Cada arquivo **grande** é commitado em **commit próprio**. O CommitIA tenta primeiro enviar o diff completo à IA (respeitando `COMMITIA_MAX_DIFF_CHARS`).
+3. Se a IA falhar (erro, timeout, resposta vazia ou inválida) e **já houve commit nesta sessão**, o **fallback** envia só o nome do arquivo, as linhas adicionadas/removidas, um contexto resumido (cabeçalhos dos hunks e uma pequena amostra) e o **último commit da sessão** — o último commit criado pelo CommitIA nesta execução (ex.: o dos arquivos pequenos). O último commit da branch **não** é usado como contexto.
+4. Se o fallback também falhar, **ou se nenhum commit foi criado nesta sessão** (ex.: só há arquivos grandes), vai direto para a **mensagem padrão de último recurso**: `chore(<escopo>): atualiza <arquivo>` (lockfiles: `chore(deps): atualiza <lockfile>`), respeitando `--type`, `--scope` e o task id da branch.
+
+As falhas intermediárias da IA continuam sendo gravadas em `.commitia/logs` (e mantidas quando o fallback resolve). Se algo falhar no meio (hook de commit, erro na IA para os arquivos pequenos, cancelamento ou Ctrl+C), os arquivos grandes ainda não commitados voltam ao stage exatamente como estavam.
+
+### Comportamento com as opções
+
+| Opção            | Comportamento                                                                                                     |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `-d, --dry-run`  | Mostra o plano e as mensagens (inclusive do fallback) sem alterar o stage nem criar commits                       |
+| `-i`             | Pergunta antes de cada commit; cancelar interrompe o fluxo e devolve os arquivos grandes ao stage                 |
+| `-a, --amend`    | Não separa os arquivos (um amend altera um único commit), mas o fallback de mensagem continua ativo               |
+| `arquivos...`    | Os arquivos passados são adicionados ao stage normalmente; os grandes entre eles são separados                    |
+
+### Configuração
+
+```bash
+COMMITIA_LARGE_FILES="true"            # false desativa todo o tratamento (padrão: true)
+COMMITIA_LARGE_FILE_LINES="1000"       # linhas alteradas (0 desativa o critério)
+COMMITIA_LARGE_FILE_BYTES="100000"     # bytes do diff/binário (0 desativa o critério)
+COMMITIA_LARGE_FILE_PATTERNS="pnpm-lock.yaml yarn.lock *.lock docs/*.generated.json"  # substitui a lista padrão
+```
+
+Os padrões são globs separados por espaço ou vírgula e comparados com o nome do arquivo e com o caminho completo. Defina `COMMITIA_LARGE_FILE_PATTERNS=""` para desativar a detecção por nome.
 
 ## 🔄 Integração com branches
 

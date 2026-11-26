@@ -40,6 +40,45 @@ COMMITIA_RAW_OUTPUT=""
 # Saída de erro do git commit quando o commit falha (hooks, validação, etc.)
 COMMITIA_COMMIT_STDERR=""
 
+# ----------------------------------------------------------------------------
+# Arquivos grandes (lockfiles e diffs muito grandes)
+# ----------------------------------------------------------------------------
+
+# Padrões (glob, separados por espaço/vírgula) de lockfiles conhecidos.
+# Casam com o nome do arquivo (basename) ou com o caminho completo.
+DEFAULT_LOCKFILE_PATTERNS="pnpm-lock.yaml package-lock.json npm-shrinkwrap.json yarn.lock bun.lock bun.lockb composer.lock Cargo.lock poetry.lock Pipfile.lock Gemfile.lock go.sum mix.lock pubspec.lock Podfile.lock Package.resolved flake.lock packages.lock.json deno.lock uv.lock pdm.lock gradle.lockfile *.lock *-lock.json *-lock.yaml *.lockb"
+
+# Arquivos grandes e pequenos detectados no stage (arrays paralelos para os grandes)
+LARGE_FILES=()
+LARGE_REASONS=()
+LARGE_BINARY=()
+SMALL_FILES=()
+
+# Escopo atual: caminhos considerados na geração da mensagem e no commit.
+# Vazio = todo o stage (comportamento padrão).
+SCOPE_PATHS=()
+SCOPE_SPECS=()
+
+# Modo do "diff" enviado à IA: full (diff real) ou summary (resumo reduzido)
+DIFF_MODE="full"
+DIFF_TRUNCATE=false
+COMMITIA_SUMMARY=""
+
+# Estado da "sessão" (execução atual do commitia)
+SESSION_LAST_COMMIT=""
+SESSION_LAST_INFO=""
+SESSION_LAST_LABEL=""
+SESSION_LOGS=()
+
+# Arquivos grandes retirados temporariamente do stage (restaurados em caso de falha)
+PENDING_FILES=()
+SAVED_TREE=""
+GIT_ROOT=""
+
+# Origem da mensagem gerada: ia, resumo ou minimo
+MSG_SOURCE="ia"
+GROUP_HINT=""
+
 # ============================================================================
 # Log de erros
 # ============================================================================
@@ -55,6 +94,44 @@ get_log_dir() {
   fi
 }
 
+# Cria o diretório de logs e, se ele estiver dentro do repositório e não for
+# ignorado, adiciona .commitia/ ao .git/info/exclude (evita commitar logs sem querer)
+prepare_log_dir() {
+  local dir="$1"
+  mkdir -p "$dir"
+
+  local root
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  [ -n "$root" ] || return 0
+  case "$dir" in
+    "$root"/*) ;;
+    *) return 0 ;;
+  esac
+
+  if ! git check-ignore -q -- "$dir/commitia-error.log" 2>/dev/null; then
+    local exclude_file
+    exclude_file=$(git rev-parse --git-path info/exclude 2>/dev/null)
+    if [ -n "$exclude_file" ]; then
+      mkdir -p "$(dirname "$exclude_file")" 2>/dev/null || true
+      printf '\n# CommitIA (logs locais)\n.commitia/\n' >> "$exclude_file" 2>/dev/null || true
+    fi
+  fi
+  return 0
+}
+
+# Gera um caminho de log único (várias falhas no mesmo segundo não se sobrescrevem)
+unique_log_path() {
+  local log_dir="$1"
+  local base="${log_dir}/commitia-error-$(date +%Y%m%d-%H%M%S)"
+  local candidate="${base}.log"
+  local n=1
+  while [ -e "$candidate" ]; do
+    candidate="${base}-${n}.log"
+    n=$((n + 1))
+  done
+  echo "$candidate"
+}
+
 # Cria o diretório de logs e grava arquivo com informações do erro
 write_error_log() {
   local raw_output="$1"
@@ -65,10 +142,10 @@ write_error_log() {
   
   local log_dir
   log_dir=$(get_log_dir)
-  mkdir -p "$log_dir"
+  prepare_log_dir "$log_dir"
   
   local log_file
-  log_file="${log_dir}/commitia-error-$(date +%Y%m%d-%H%M%S).log"
+  log_file=$(unique_log_path "$log_dir")
   
   {
     echo "=============================================="
@@ -107,10 +184,10 @@ write_commit_failure_log() {
   
   local log_dir
   log_dir=$(get_log_dir)
-  mkdir -p "$log_dir"
+  prepare_log_dir "$log_dir"
   
   local log_file
-  log_file="${log_dir}/commitia-error-$(date +%Y%m%d-%H%M%S).log"
+  log_file=$(unique_log_path "$log_dir")
   
   {
     echo "=============================================="
@@ -135,11 +212,23 @@ write_commit_failure_log() {
   echo "$log_file"
 }
 
-# Remove todos os arquivos de log da pasta de logs (após commit bem-sucedido)
+# Remove os arquivos de log da pasta de logs (após commit bem-sucedido).
+# Preserva os logs de falhas intermediárias da IA gerados nesta execução
+# (SESSION_LOGS), por exemplo quando o fallback resolveu a mensagem.
 clear_error_logs() {
-  local log_dir
+  local log_dir f s keep
   log_dir=$(get_log_dir)
-  [ -d "$log_dir" ] && rm -f "${log_dir}"/commitia-error-*.log 2>/dev/null || true
+  [ -d "$log_dir" ] || return 0
+
+  for f in "$log_dir"/commitia-error-*.log; do
+    [ -e "$f" ] || continue
+    keep=false
+    for s in "${SESSION_LOGS[@]}"; do
+      if [ "$s" = "$f" ]; then keep=true; fi
+    done
+    if [ "$keep" = false ]; then rm -f "$f" 2>/dev/null || true; fi
+  done
+  return 0
 }
 
 # ============================================================================
@@ -233,6 +322,17 @@ print_help() {
   echo "    - COMMITIA_<CLI>_MODEL: modelo opcional (CURSOR, COPILOT, CLAUDE, CODEX, GEMINI_CLI)"
   echo "    - COMMITIA_LANGUAGE: pt, en, es (padrão: pt)"
   echo "    - COMMITIA_AUTO_STAGE: true, false (padrão: true)"
+  echo "    - COMMITIA_LARGE_FILES: true, false - trata arquivos grandes em commits separados (padrão: true)"
+  echo "    - COMMITIA_LARGE_FILE_LINES: linhas alteradas para considerar um arquivo grande (padrão: 1000; 0 desativa)"
+  echo "    - COMMITIA_LARGE_FILE_BYTES: bytes do diff/binário para considerar grande (padrão: 100000; 0 desativa)"
+  echo "    - COMMITIA_LARGE_FILE_PATTERNS: globs de arquivos sempre grandes, ex.: lockfiles (padrão: lista de lockfiles)"
+  echo ""
+  echo -e "${BOLD}ARQUIVOS GRANDES:${NC}"
+  echo "  Lockfiles (pnpm-lock.yaml, package-lock.json, yarn.lock...) e arquivos com diff muito grande"
+  echo "  são commitados separadamente: primeiro os pequenos, depois cada arquivo grande. Se a IA falhar"
+  echo "  com o diff completo, o commitia envia só nome, linhas alteradas e contexto resumido (mais o"
+  echo "  último commit da sessão, se houver) e, em último caso, usa uma mensagem padrão. Sem commit na"
+  echo "  sessão, vai direto para a mensagem padrão. Com --amend não há separação."
   echo ""
 }
 
@@ -467,6 +567,24 @@ load_config() {
   AI_PROVIDER="${CLI_PROVIDER:-${COMMITIA_PROVIDER:-amp}}"
   LANGUAGE="${CLI_LANGUAGE:-${COMMITIA_LANGUAGE:-pt}}"
   AUTO_STAGE="${CLI_AUTO_STAGE:-${COMMITIA_AUTO_STAGE:-true}}"
+
+  # Arquivos grandes (lockfiles e diffs muito grandes)
+  LARGE_FILES_ENABLED="${COMMITIA_LARGE_FILES:-true}"
+  LARGE_FILE_LINES=$(normalize_int "${COMMITIA_LARGE_FILE_LINES:-1000}" 1000 "COMMITIA_LARGE_FILE_LINES")
+  LARGE_FILE_BYTES=$(normalize_int "${COMMITIA_LARGE_FILE_BYTES:-100000}" 100000 "COMMITIA_LARGE_FILE_BYTES")
+  LARGE_FILE_PATTERNS="${COMMITIA_LARGE_FILE_PATTERNS-$DEFAULT_LOCKFILE_PATTERNS}"
+}
+
+# Valida inteiro não negativo; usa o padrão (com aviso) se o valor for inválido
+normalize_int() {
+  local value="$1" default="$2" name="$3"
+  case "$value" in
+    ''|*[!0-9]*)
+      warn "$name inválido ('$value'); usando o padrão $default" >&2
+      echo "$default"
+      ;;
+    *) echo "$value" ;;
+  esac
 }
 
 # Encontra o arquivo de configuração do projeto (na raiz do repositório Git)
@@ -493,12 +611,57 @@ get_task_id_from_branch() {
   fi
 }
 
+# Monta os pathspecs literais (relativos à raiz do repo) do escopo atual
+set_scope() {
+  SCOPE_PATHS=("$@")
+  SCOPE_SPECS=()
+  local f
+  for f in "$@"; do
+    SCOPE_SPECS+=(":(top,literal)$f")
+  done
+}
+
+clear_scope() {
+  SCOPE_PATHS=()
+  SCOPE_SPECS=()
+}
+
+# Diff staged (do escopo atual, se houver). No modo "summary" devolve o resumo
+# reduzido em vez do diff completo. Com DIFF_TRUNCATE=true respeita
+# COMMITIA_MAX_DIFF_CHARS.
 get_staged_diff() {
-  git diff --staged
+  if [ "$DIFF_MODE" = "summary" ]; then
+    printf '%s\n' "$COMMITIA_SUMMARY"
+    return 0
+  fi
+
+  if [ "$DIFF_TRUNCATE" = true ]; then
+    local out
+    if [ ${#SCOPE_SPECS[@]} -gt 0 ]; then
+      out=$(git diff --staged -- "${SCOPE_SPECS[@]}" | head -c $((COMMITIA_MAX_DIFF_CHARS + 1)))
+    else
+      out=$(git diff --staged | head -c $((COMMITIA_MAX_DIFF_CHARS + 1)))
+    fi
+    if [ ${#out} -gt "$COMMITIA_MAX_DIFF_CHARS" ]; then
+      out="${out:0:$COMMITIA_MAX_DIFF_CHARS}"$'\n'"... [diff truncado]"
+    fi
+    printf '%s\n' "$out"
+    return 0
+  fi
+
+  if [ ${#SCOPE_SPECS[@]} -gt 0 ]; then
+    git diff --staged -- "${SCOPE_SPECS[@]}"
+  else
+    git diff --staged
+  fi
 }
 
 get_staged_files() {
-  git diff --staged --name-only
+  if [ ${#SCOPE_SPECS[@]} -gt 0 ]; then
+    git diff --staged --name-only -- "${SCOPE_SPECS[@]}"
+  else
+    git diff --staged --name-only
+  fi
 }
 
 # ============================================================================
@@ -511,6 +674,7 @@ build_prompt() {
   local forced_type="$3"
   local forced_scope="$4"
   local lang="$5"
+  local mode="${6:-full}"
   
   local lang_text
   case "$lang" in
@@ -536,7 +700,13 @@ build_prompt() {
     type_text="Tipos permitidos: feat, fix, docs, style, refactor, test, chore, perf, ci, build, revert."
   fi
   
-  local prompt="Analise 'git diff --staged' e gere uma mensagem de commit $lang_text no formato 'tipo(escopo): descrição'. $type_text $scope_text A descrição deve ser curta, começar com minúscula e não terminar com ponto."
+  local prompt
+  if [ "$mode" = "summary" ]; then
+    # Fallback: o diff completo não é enviado, apenas um resumo da alteração
+    prompt="Gere uma mensagem de commit $lang_text no formato 'tipo(escopo): descrição' com base no RESUMO da alteração fornecido (o diff completo é grande demais e não está disponível). NÃO execute comandos e NÃO leia arquivos. Use o último commit apenas como contexto de estilo e escopo, sem copiar a mensagem dele. $type_text $scope_text A descrição deve ser curta, começar com minúscula e não terminar com ponto."
+  else
+    prompt="Analise 'git diff --staged' e gere uma mensagem de commit $lang_text no formato 'tipo(escopo): descrição'. $type_text $scope_text A descrição deve ser curta, começar com minúscula e não terminar com ponto."
+  fi
   
   if [ -n "$context" ]; then
     prompt="$prompt Contexto adicional: \"$context\"."
@@ -549,6 +719,13 @@ build_prompt() {
 
 generate_with_amp() {
   local prompt="$1"
+
+  # Em arquivos grandes (escopo restrito ou resumo) o conteúdo vai no próprio prompt,
+  # pois o amp executaria 'git diff --staged' sobre todo o stage
+  if [ "$DIFF_MODE" = "summary" ] || [ ${#SCOPE_SPECS[@]} -gt 0 ]; then
+    prompt="${prompt}"$'\n\n'"Conteúdo a analisar (use somente isto; NÃO execute comandos):"$'\n'"$(get_staged_diff)"
+  fi
+
   echo "$prompt" | amp -x --dangerously-allow-all 2>&1
 }
 
@@ -585,7 +762,11 @@ build_cli_prompt() {
     diff="${diff:0:$COMMITIA_MAX_DIFF_CHARS}"$'\n'"... [diff truncado]"
   fi
 
-  printf '%s\n\nO diff das alterações já está abaixo. NÃO execute comandos, NÃO leia arquivos e NÃO edite nada.\n\nDiff:\n%s\n' "$prompt" "$diff"
+  if [ "$DIFF_MODE" = "summary" ]; then
+    printf '%s\n\nO resumo das alterações já está abaixo. NÃO execute comandos, NÃO leia arquivos e NÃO edite nada.\n\nResumo:\n%s\n' "$prompt" "$diff"
+  else
+    printf '%s\n\nO diff das alterações já está abaixo. NÃO execute comandos, NÃO leia arquivos e NÃO edite nada.\n\nDiff:\n%s\n' "$prompt" "$diff"
+  fi
 }
 
 generate_with_cursor() {
@@ -875,6 +1056,601 @@ do_commit() {
 }
 
 # ============================================================================
+# Arquivos grandes (lockfiles e diffs muito grandes)
+# ============================================================================
+
+# Verifica se o caminho casa com algum dos globs (separados por espaço/vírgula).
+# Compara com o nome do arquivo (basename) e com o caminho completo.
+matches_patterns() {
+  local path="$1" patterns="$2" base pat
+  base="${path##*/}"
+
+  local old_ifs="$IFS"
+  set -f
+  IFS=$', \t\n'
+  for pat in $patterns; do
+    # shellcheck disable=SC2254
+    case "$base" in
+      $pat) set +f; IFS="$old_ifs"; return 0 ;;
+    esac
+    # shellcheck disable=SC2254
+    case "$path" in
+      $pat) set +f; IFS="$old_ifs"; return 0 ;;
+    esac
+  done
+  set +f
+  IFS="$old_ifs"
+  return 1
+}
+
+# O arquivo é um lockfile conhecido? (usado no commit de último recurso)
+is_lockfile() {
+  matches_patterns "$1" "$DEFAULT_LOCKFILE_PATTERNS"
+}
+
+# O caminho está na lista de arquivos grandes detectados?
+is_large_path() {
+  local f
+  for f in "${LARGE_FILES[@]}"; do
+    [ "$f" = "$1" ] && return 0
+  done
+  return 1
+}
+
+# Detecta arquivos grandes no stage. Preenche LARGE_FILES (+ LARGE_REASONS e
+# LARGE_BINARY em paralelo) e SMALL_FILES. Critérios (qualquer um):
+#   - nome casa com COMMITIA_LARGE_FILE_PATTERNS (lockfiles por padrão);
+#   - linhas alteradas (numstat) >= COMMITIA_LARGE_FILE_LINES;
+#   - diff (ou binário) com bytes >= COMMITIA_LARGE_FILE_BYTES.
+detect_large_files() {
+  LARGE_FILES=()
+  LARGE_REASONS=()
+  LARGE_BINARY=()
+  SMALL_FILES=()
+  [ "$LARGE_FILES_ENABLED" = true ] || return 0
+
+  # Passo 1: blobs (antigo/novo) de cada arquivo, para medir o tamanho em lote
+  local meta path
+  local -a parts r_paths=() r_blobs=() sizes=()
+  while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+    read -ra parts <<< "$meta"
+    r_paths+=("$path")
+    r_blobs+=("${parts[2]}" "${parts[3]}")
+  done < <(git diff --staged --raw -z --no-renames --no-abbrev 2>/dev/null)
+
+  if [ "$LARGE_FILE_BYTES" -gt 0 ] && [ ${#r_blobs[@]} -gt 0 ]; then
+    local line
+    while IFS= read -r line; do
+      case "$line" in
+        *missing*) sizes+=(0) ;;
+        *) sizes+=("$line") ;;
+      esac
+    done < <(printf '%s\n' "${r_blobs[@]}" | git cat-file --batch-check='%(objectsize)' 2>/dev/null)
+  fi
+
+  # Passo 2: numstat (linhas adicionadas/removidas; "-" = binário)
+  local rec rest added deleted p reason is_bin lines maxsize diff_bytes i=0 s_old s_new
+  while IFS= read -r -d '' rec; do
+    added="${rec%%$'\t'*}"
+    rest="${rec#*$'\t'}"
+    deleted="${rest%%$'\t'*}"
+    p="${rest#*$'\t'}"
+
+    is_bin=false
+    [ "$added" = "-" ] && is_bin=true
+
+    # Maior tamanho entre o blob antigo e o novo (0 se não medido)
+    maxsize=0
+    if [ "${r_paths[$i]}" = "$p" ] && [ ${#sizes[@]} -gt $((i * 2 + 1)) ]; then
+      s_old="${sizes[$((i * 2))]}"
+      s_new="${sizes[$((i * 2 + 1))]}"
+      case "$s_old$s_new" in
+        *[!0-9]*) ;;
+        *)
+          maxsize=$s_old
+          [ "$s_new" -gt "$maxsize" ] && maxsize=$s_new
+          ;;
+      esac
+    fi
+
+    reason=""
+    if matches_patterns "$p" "$LARGE_FILE_PATTERNS"; then
+      reason="lockfile/padrão de arquivo grande"
+    elif [ "$is_bin" = true ]; then
+      if [ "$LARGE_FILE_BYTES" -gt 0 ] && [ "$maxsize" -ge "$LARGE_FILE_BYTES" ]; then
+        reason="binário de $maxsize bytes"
+      fi
+    else
+      lines=$((added + deleted))
+      if [ "$LARGE_FILE_LINES" -gt 0 ] && [ "$lines" -ge "$LARGE_FILE_LINES" ]; then
+        reason="diff com $lines linhas alteradas"
+      elif [ "$LARGE_FILE_BYTES" -gt 0 ] && [ "$maxsize" -ge "$LARGE_FILE_BYTES" ]; then
+        # Só mede o diff real dos candidatos (arquivo grande), para ser rápido
+        diff_bytes=$(git diff --staged --no-renames -- ":(top,literal)$p" | wc -c | tr -d ' ')
+        if [ "${diff_bytes:-0}" -ge "$LARGE_FILE_BYTES" ]; then
+          reason="diff de $diff_bytes bytes"
+        fi
+      fi
+    fi
+
+    if [ -n "$reason" ]; then
+      LARGE_FILES+=("$p")
+      LARGE_BINARY+=("$is_bin")
+      if [ "$is_bin" = true ]; then
+        LARGE_REASONS+=("$reason; arquivo binário")
+      else
+        LARGE_REASONS+=("$reason; +$added -$deleted")
+      fi
+    else
+      SMALL_FILES+=("$p")
+    fi
+    i=$((i + 1))
+  done < <(git diff --staged --numstat -z --no-renames 2>/dev/null)
+
+  return 0
+}
+
+# Descreve um commit (assunto, corpo curto e estatística resumida)
+describe_commit() {
+  local ref="${1:-HEAD}" head_part stat_part
+  head_part=$(git log -1 --format='%h %s%n%b' "$ref" 2>/dev/null | head -n 8)
+  [ -n "$head_part" ] || return 0
+  stat_part=$(git show --stat --format= "$ref" 2>/dev/null | head -n 8)
+  printf '%s\n%s' "$head_part" "$stat_part"
+}
+
+# Resumo da alteração para o fallback: nome do arquivo, linhas alteradas,
+# cabeçalhos dos hunks, pequena amostra de linhas e o último commit da sessão
+# (commit criado nesta execução do commitia; nunca o último commit da branch).
+build_large_summary() {
+  local -a files=()
+  local f
+  if [ ${#SCOPE_PATHS[@]} -gt 0 ]; then
+    files=("${SCOPE_PATHS[@]}")
+  else
+    while IFS= read -r -d '' f; do
+      files+=("$f")
+    done < <(git diff --staged --name-only -z --no-renames 2>/dev/null)
+  fi
+
+  local out="" total=${#files[@]} shown=0 detail=0 line added deleted spec
+  out="RESUMO DA ALTERAÇÃO (diff completo omitido por ser grande demais)"
+  out+=$'\n'"Branch: $(git branch --show-current 2>/dev/null || echo '')"
+  out+=$'\n'"Arquivos alterados: $total"
+
+  for f in "${files[@]}"; do
+    shown=$((shown + 1))
+    if [ "$shown" -gt 40 ]; then
+      out+=$'\n'"... e mais $((total - 40)) arquivo(s)"
+      break
+    fi
+    spec=":(top,literal)$f"
+    line=$(git diff --staged --numstat --no-renames -- "$spec" 2>/dev/null | head -n 1)
+    added="${line%%$'\t'*}"
+    deleted="${line#*$'\t'}"
+    deleted="${deleted%%$'\t'*}"
+
+    if [ -z "$line" ]; then
+      out+=$'\n'"- $f"
+    elif [ "$added" = "-" ]; then
+      out+=$'\n'"- $f: arquivo binário (sem contagem de linhas)"
+    else
+      out+=$'\n'"- $f: +$added -$deleted linhas alteradas"
+      if is_large_path "$f" && [ "$detail" -lt 3 ]; then
+        detail=$((detail + 1))
+        out+=$'\n'"$(git diff --staged --no-renames --unified=0 -- "$spec" 2>/dev/null | awk -v maxh=15 -v maxl=20 '
+          /^@@/ { seen = 1; nh++; if (nh <= maxh) { h = $0; if (length(h) > 160) h = substr(h, 1, 160); hunks[nh] = h } next }
+          seen && /^[+-]/ {
+            nc++
+            if (nl < maxl) { l = $0; if (length(l) > 160) l = substr(l, 1, 160); lines[++nl] = l }
+          }
+          END {
+            printf "  Hunks: %d\n", nh
+            if (nh > 0) {
+              print "  Cabeçalhos dos hunks (primeiros):"
+              for (i = 1; i <= nh && i <= maxh; i++) print "    " hunks[i]
+            }
+            if (nl > 0) {
+              printf "  Amostra das linhas alteradas (%d de %d):\n", nl, nc
+              for (i = 1; i <= nl; i++) print "    " lines[i]
+            }
+          }')"
+      fi
+    fi
+  done
+
+  # Último commit da sessão (o fallback só roda quando ele existe)
+  if [ -n "$SESSION_LAST_INFO" ]; then
+    out+=$'\n\n'"${SESSION_LAST_LABEL}:"$'\n'"${SESSION_LAST_INFO}"
+  fi
+
+  # Limita o tamanho total do resumo
+  if [ ${#out} -gt 8000 ]; then
+    out="${out:0:8000}"$'\n'"... [resumo truncado]"
+  fi
+  printf '%s' "$out"
+}
+
+# Mensagem determinística de último recurso (a IA falhou mesmo com o resumo).
+# Lockfiles: chore(deps): atualiza <lockfile>. Respeita tipo/escopo forçados e task id.
+fallback_commit_message() {
+  local -a files=()
+  local f
+  if [ ${#SCOPE_PATHS[@]} -gt 0 ]; then
+    files=("${SCOPE_PATHS[@]}")
+  else
+    while IFS= read -r -d '' f; do
+      files+=("$f")
+    done < <(git diff --staged --name-only -z --no-renames 2>/dev/null)
+  fi
+
+  local type="${FORCED_TYPE:-chore}"
+  local all_locks=true
+  for f in "${files[@]}"; do
+    is_lockfile "$f" || all_locks=false
+  done
+  [ ${#files[@]} -gt 0 ] || all_locks=false
+
+  local scope
+  if [ -n "$FORCED_SCOPE" ]; then
+    scope="$FORCED_SCOPE"
+  elif [ -n "$TASK_ID" ]; then
+    scope="$TASK_ID"
+  elif [ "$all_locks" = true ]; then
+    scope="deps"
+  elif [ ${#files[@]} -gt 0 ]; then
+    f="${files[0]}"
+    if [[ "$f" == */* ]]; then
+      scope="${f%%/*}"
+    else
+      scope="${f##*/}"
+      scope="${scope%.*}"
+      [ -n "$scope" ] || scope="${f##*/}"
+    fi
+    scope=$(printf '%s' "$scope" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-\n' '-')
+    scope="${scope#-}"
+    scope="${scope%-}"
+  fi
+  [ -n "$scope" ] || scope="arquivos"
+
+  local verb files_word
+  case "$LANGUAGE" in
+    en) verb="update"; files_word="files" ;;
+    es) verb="actualiza"; files_word="archivos" ;;
+    *) verb="atualiza"; files_word="arquivos" ;;
+  esac
+
+  if [ ${#files[@]} -eq 1 ]; then
+    echo "$type($scope): $verb ${files[0]##*/}"
+  else
+    echo "$type($scope): $verb ${#files[@]} $files_word"
+  fi
+}
+
+# Devolve um arquivo ao stage exatamente como estava no stage original
+# (usa a árvore salva em SAVED_TREE; preserva staging parcial e remoções)
+restore_path_to_stage() {
+  local path="$1" rec mode_type_sha mode sha
+  local -a fields=()
+
+  rec=""
+  IFS= read -r -d '' rec < <(git -C "$GIT_ROOT" ls-tree --full-tree -z "$SAVED_TREE" -- "$path" 2>/dev/null) || true
+
+  if [ -n "$rec" ] && [ "${rec#*$'\t'}" = "$path" ]; then
+    mode_type_sha="${rec%%$'\t'*}"
+    read -ra fields <<< "$mode_type_sha"
+    mode="${fields[0]}"
+    sha="${fields[2]}"
+    git -C "$GIT_ROOT" update-index --add --cacheinfo "$mode,$sha,$path"
+  else
+    # Não existia na árvore salva: era uma remoção staged
+    git -C "$GIT_ROOT" update-index --force-remove -- "$path"
+  fi
+}
+
+# Tira arquivos do stage (mantém as alterações no diretório de trabalho)
+unstage_paths() {
+  local -a specs=()
+  local f
+  for f in "$@"; do
+    specs+=(":(top,literal)$f")
+  done
+  git reset -q -- "${specs[@]}" >/dev/null 2>&1 || true
+}
+
+# Remove um arquivo da lista de pendentes
+remove_pending() {
+  local target="$1" f
+  local -a rest=()
+  for f in "${PENDING_FILES[@]}"; do
+    [ "$f" = "$target" ] || rest+=("$f")
+  done
+  PENDING_FILES=("${rest[@]}")
+}
+
+# Devolve ao stage os arquivos grandes ainda não commitados (falha, cancelamento
+# ou interrupção), para que nada se perca. Idempotente.
+restore_pending_files() {
+  [ ${#PENDING_FILES[@]} -gt 0 ] || return 0
+
+  local f
+  local -a to_restore=("${PENDING_FILES[@]}")
+  PENDING_FILES=()
+  for f in "${to_restore[@]}"; do
+    restore_path_to_stage "$f" 2>/dev/null || true
+  done
+  warn "Arquivos grandes devolvidos ao stage (não commitados): ${to_restore[*]}" || true
+  return 0
+}
+
+# ============================================================================
+# Geração + commit de um grupo (todo o stage ou o escopo atual)
+# ============================================================================
+
+# Tenta gerar a mensagem com a IA para o prompt dado.
+# Define COMMIT_MSG e COMMITIA_RAW_OUTPUT.
+ai_attempt() {
+  local prompt="$1"
+  COMMITIA_RAW_FILE=$(mktemp)
+  COMMIT_MSG=$(generate_commit_message "$prompt") || COMMIT_MSG=""
+  COMMITIA_RAW_OUTPUT=$(cat "$COMMITIA_RAW_FILE" 2>/dev/null || true)
+  rm -f "$COMMITIA_RAW_FILE"
+}
+
+# Grava o log de uma falha da IA e registra na sessão (para não ser apagado
+# pelo clear_error_logs). Define LOG_PATH.
+log_ai_failure() {
+  local prompt="$1" diff_content="$2"
+  LOG_PATH=$(write_error_log \
+    "$COMMITIA_RAW_OUTPUT" \
+    "$prompt" \
+    "$diff_content" \
+    "$(get_staged_files)" \
+    "$(git branch --show-current 2>/dev/null || echo '')")
+  SESSION_LOGS+=("$LOG_PATH")
+}
+
+# Gera a mensagem e comita o grupo atual.
+# $1: allow_fallback (true = tenta resumo e depois mensagem de último recurso)
+# $2: skip_full (true = não envia o diff completo, ex.: arquivo binário)
+# Retorno: 0 = ok (ou dry-run), 1 = erro, 2 = cancelado pelo usuário
+commit_staged_group() {
+  local allow_fallback="${1:-false}"
+  local skip_full="${2:-false}"
+
+  # Contexto para a IA (-m do usuário + dica de lockfile)
+  local ctx="$CONTEXT_MSG"
+  if [ -n "$GROUP_HINT" ] && [ -z "$FORCED_TYPE" ]; then
+    if [ -n "$ctx" ]; then ctx="$ctx. $GROUP_HINT"; else ctx="$GROUP_HINT"; fi
+  fi
+
+  MSG_SOURCE="ia"
+  DIFF_MODE="full"
+  COMMIT_MSG=""
+  local prompt
+
+  if [ "$skip_full" = true ]; then
+    info "Arquivo binário: o diff não será enviado, apenas um resumo"
+  else
+    prompt=$(build_prompt "$TASK_ID" "$ctx" "$FORCED_TYPE" "$FORCED_SCOPE" "$LANGUAGE" full)
+    info "Gerando mensagem com IA ($AI_PROVIDER)..."
+    ai_attempt "$prompt"
+
+    if [ -z "$COMMIT_MSG" ]; then
+      log_ai_failure "$prompt" "$(get_staged_diff)"
+      if [ "$allow_fallback" != true ]; then
+        echo ""
+        echo -e "${RED}✗ Erro: Não foi possível gerar a mensagem de commit${NC}" >&2
+        echo -e "  Log gravado em: ${BOLD}$LOG_PATH${NC}" >&2
+        return 1
+      fi
+      warn "A IA falhou com o diff completo (log: $LOG_PATH)"
+    fi
+  fi
+
+  # Sem commit criado nesta sessão não há contexto para o fallback com a IA
+  # (o último commit da branch NÃO é usado): vai direto ao último recurso
+  if [ -z "$COMMIT_MSG" ] && [ -z "$SESSION_LAST_INFO" ]; then
+    info "Nenhum commit nesta sessão do commitia: indo direto para a mensagem de último recurso"
+    COMMIT_MSG=$(fallback_commit_message)
+    MSG_SOURCE="minimo"
+  fi
+
+  # Fallback 1: somente nome, linhas alteradas, contexto resumido e último commit
+  # da sessão (commits criados nesta execução do commitia)
+  if [ -z "$COMMIT_MSG" ]; then
+    COMMITIA_SUMMARY=$(build_large_summary)
+    DIFF_MODE="summary"
+    info "Fallback: enviando à IA apenas nome do arquivo, linhas alteradas e contexto resumido..."
+    prompt=$(build_prompt "$TASK_ID" "$ctx" "$FORCED_TYPE" "$FORCED_SCOPE" "$LANGUAGE" summary)
+    ai_attempt "$prompt"
+
+    if [ -n "$COMMIT_MSG" ]; then
+      MSG_SOURCE="resumo"
+    else
+      log_ai_failure "$prompt" "$COMMITIA_SUMMARY"
+      warn "A IA também falhou com o resumo (log: $LOG_PATH)"
+      # Fallback 2 (último recurso): mensagem determinística
+      COMMIT_MSG=$(fallback_commit_message)
+      MSG_SOURCE="minimo"
+    fi
+    DIFF_MODE="full"
+  fi
+
+  echo ""
+  echo -e "${BOLD}Mensagem gerada:${NC}"
+  echo -e "  ${GREEN}$COMMIT_MSG${NC}"
+  case "$MSG_SOURCE" in
+    resumo) info "Mensagem gerada pelo fallback (nome, linhas alteradas e contexto resumido)" ;;
+    minimo) warn "A IA falhou; usada mensagem padrão de último recurso" ;;
+  esac
+  echo ""
+
+  # Dry run
+  if [ "$DRY_RUN" = true ]; then
+    info "Modo dry-run: commit não realizado"
+    SESSION_LAST_INFO="$COMMIT_MSG (simulado: dry-run)"
+    SESSION_LAST_LABEL="Último commit desta sessão do commitia (simulado)"
+    return 0
+  fi
+
+  # Modo interativo
+  if [ "$INTERACTIVE" = true ]; then
+    echo -e "${YELLOW}Deseja realizar o commit? [S/n/e]${NC}"
+    echo "  S - Sim, realizar commit"
+    echo "  n - Não, cancelar"
+    echo "  e - Editar mensagem"
+    read -r -n 1 response
+    echo ""
+
+    case $response in
+      [Nn])
+        info "Commit cancelado"
+        return 2
+        ;;
+      [Ee])
+        echo -e "${YELLOW}Digite a nova mensagem:${NC}"
+        read -r COMMIT_MSG
+        ;;
+    esac
+  fi
+
+  # Realiza o commit
+  if do_commit "$COMMIT_MSG"; then
+    clear_error_logs
+    SESSION_LAST_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "")
+    SESSION_LAST_INFO=$(describe_commit HEAD)
+    SESSION_LAST_LABEL="Último commit feito nesta sessão do commitia"
+    success "Commit realizado: $COMMIT_MSG"
+    return 0
+  fi
+
+  LOG_PATH=$(write_commit_failure_log \
+    "$COMMIT_MSG" \
+    "$COMMITIA_COMMIT_STDERR" \
+    "$(get_staged_files)" \
+    "$(git branch --show-current 2>/dev/null || echo '')")
+  echo ""
+  echo -e "${RED}✗ Erro: Falha ao realizar commit${NC}" >&2
+  echo -e "  Log gravado em: ${BOLD}$LOG_PATH${NC}" >&2
+  return 1
+}
+
+# Fluxo com arquivos grandes: primeiro os pequenos, depois cada arquivo grande
+# em um commit separado. Retorno: 0 = ok, 1 = erro, 2 = cancelado.
+run_large_files_flow() {
+  local nl=${#LARGE_FILES[@]} ns=${#SMALL_FILES[@]}
+  local i f rc step=0 steps
+
+  steps=$nl
+  [ "$ns" -gt 0 ] && steps=$((steps + 1))
+
+  echo -e "${YELLOW}⚠ Arquivos grandes detectados (serão commitados separadamente):${NC}"
+  for ((i = 0; i < nl; i++)); do
+    echo -e "  ${CYAN}→${NC} ${LARGE_FILES[$i]} (${LARGE_REASONS[$i]})"
+  done
+  if [ "$ns" -gt 0 ]; then
+    info "Primeiro serão commitados os $ns arquivo(s) pequeno(s); depois cada arquivo grande, em commit próprio ($steps commits no total)"
+  else
+    info "Cada arquivo grande será commitado separadamente ($steps commit(s))"
+  fi
+  [ "$DRY_RUN" = true ] && info "Modo dry-run: o stage não será alterado"
+  echo ""
+
+  DIFF_TRUNCATE=true
+
+  # Só é preciso mexer no stage se houver mais de um commit a fazer
+  local need_split=false
+  if [ "$ns" -gt 0 ] || [ "$nl" -gt 1 ]; then need_split=true; fi
+
+  if [ "$need_split" = true ] && [ "$DRY_RUN" != true ]; then
+    GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+    SAVED_TREE=$(git write-tree 2>/dev/null) || SAVED_TREE=""
+    if [ -z "$GIT_ROOT" ] || [ -z "$SAVED_TREE" ]; then
+      warn "Não foi possível salvar o estado do stage (merge/conflito em andamento?); commitando tudo junto"
+      clear_scope
+      rc=0
+      commit_staged_group true false || rc=$?
+      DIFF_TRUNCATE=false
+      return $rc
+    fi
+
+    # Qualquer saída (erro, Ctrl+C) devolve os arquivos grandes ao stage
+    trap 'restore_pending_files' EXIT
+    trap 'restore_pending_files; exit 130' INT TERM
+
+    PENDING_FILES=("${LARGE_FILES[@]}")
+    unstage_paths "${LARGE_FILES[@]}"
+
+    # Garante que nenhum arquivo grande ficou no stage antes do commit dos pequenos
+    set_scope "${LARGE_FILES[@]}"
+    if [ -n "$(get_staged_files)" ]; then
+      clear_scope
+      restore_pending_files
+      error "Não foi possível separar os arquivos grandes do stage"
+    fi
+  fi
+
+  # 1) Arquivos pequenos
+  if [ "$ns" -gt 0 ]; then
+    step=$((step + 1))
+    set_scope "${SMALL_FILES[@]}"
+    GROUP_HINT=""
+    info "[$step/$steps] Commitando os arquivos pequenos ($ns)..."
+    for f in "${SMALL_FILES[@]}"; do
+      echo -e "  ${CYAN}→${NC} $f"
+    done
+    echo ""
+    rc=0
+    commit_staged_group false false || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      restore_pending_files
+      clear_scope
+      DIFF_TRUNCATE=false
+      return $rc
+    fi
+  fi
+
+  # 2) Cada arquivo grande em commit separado
+  for ((i = 0; i < nl; i++)); do
+    f="${LARGE_FILES[$i]}"
+    step=$((step + 1))
+
+    # Devolve este arquivo ao stage (estado original) antes de comitá-lo
+    if [ "$DRY_RUN" != true ] && [ ${#PENDING_FILES[@]} -gt 0 ]; then
+      restore_path_to_stage "$f"
+      remove_pending "$f"
+    fi
+
+    set_scope "$f"
+    GROUP_HINT=""
+    if is_lockfile "$f"; then
+      GROUP_HINT="alteração em arquivo de dependências (lockfile); prefira o tipo 'build' ou 'chore'"
+    fi
+
+    echo ""
+    info "[$step/$steps] Commitando arquivo grande: ${BOLD}$f${NC}"
+    rc=0
+    commit_staged_group true "${LARGE_BINARY[$i]}" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      restore_pending_files
+      clear_scope
+      DIFF_TRUNCATE=false
+      return $rc
+    fi
+  done
+
+  clear_scope
+  DIFF_TRUNCATE=false
+  trap - EXIT INT TERM
+
+  if [ ${#SESSION_LOGS[@]} -gt 0 ]; then
+    info "Logs das falhas intermediárias da IA mantidos em: $(get_log_dir)"
+  fi
+  return 0
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -1003,76 +1779,25 @@ main() {
     info "Task ID detectado: ${BOLD}$TASK_ID${NC}"
   fi
   
-  # Gera o prompt
-  PROMPT=$(build_prompt "$TASK_ID" "$CONTEXT_MSG" "$FORCED_TYPE" "$FORCED_SCOPE" "$LANGUAGE")
+  # Detecta arquivos grandes (lockfiles, diffs muito grandes, binários grandes)
+  detect_large_files
   
-  # Gera a mensagem
-  info "Gerando mensagem com IA ($AI_PROVIDER)..."
-  COMMITIA_RAW_FILE=$(mktemp)
-  COMMIT_MSG=$(generate_commit_message "$PROMPT")
-  COMMITIA_RAW_OUTPUT=$(cat "$COMMITIA_RAW_FILE" 2>/dev/null || true)
-  rm -f "$COMMITIA_RAW_FILE"
-  
-  if [ -z "$COMMIT_MSG" ]; then
-    LOG_PATH=$(write_error_log \
-      "$COMMITIA_RAW_OUTPUT" \
-      "$PROMPT" \
-      "$(get_staged_diff)" \
-      "$(get_staged_files)" \
-      "$(git branch --show-current 2>/dev/null || echo '')")
-    echo ""
-    echo -e "${RED}✗ Erro: Não foi possível gerar a mensagem de commit${NC}" >&2
-    echo -e "  Log gravado em: ${BOLD}$LOG_PATH${NC}" >&2
-    exit 1
-  fi
-  
-  echo ""
-  echo -e "${BOLD}Mensagem gerada:${NC}"
-  echo -e "  ${GREEN}$COMMIT_MSG${NC}"
-  echo ""
-  
-  # Dry run
-  if [ "$DRY_RUN" = true ]; then
-    info "Modo dry-run: commit não realizado"
-    exit 0
-  fi
-  
-  # Modo interativo
-  if [ "$INTERACTIVE" = true ]; then
-    echo -e "${YELLOW}Deseja realizar o commit? [S/n/e]${NC}"
-    echo "  S - Sim, realizar commit"
-    echo "  n - Não, cancelar"
-    echo "  e - Editar mensagem"
-    read -r -n 1 response
-    echo ""
-    
-    case $response in
-      [Nn])
-        info "Commit cancelado"
-        exit 0
-        ;;
-      [Ee])
-        echo -e "${YELLOW}Digite a nova mensagem:${NC}"
-        read -r COMMIT_MSG
-        ;;
-    esac
-  fi
-  
-  # Realiza o commit
-  if do_commit "$COMMIT_MSG"; then
-    clear_error_logs
-    success "Commit realizado: $COMMIT_MSG"
+  local rc=0
+  if [ ${#LARGE_FILES[@]} -eq 0 ]; then
+    # Fluxo padrão: um único commit com todo o stage
+    commit_staged_group false false || rc=$?
+  elif [ "$AMEND" = true ]; then
+    # --amend: não há como separar em vários commits; usa só o fallback da mensagem
+    warn "--amend: arquivos grandes (${LARGE_FILES[*]}) não serão separados; o fallback de mensagem continua ativo"
+    DIFF_TRUNCATE=true
+    commit_staged_group true false || rc=$?
   else
-    LOG_PATH=$(write_commit_failure_log \
-      "$COMMIT_MSG" \
-      "$COMMITIA_COMMIT_STDERR" \
-      "$(get_staged_files)" \
-      "$(git branch --show-current 2>/dev/null || echo '')")
-    echo ""
-    echo -e "${RED}✗ Erro: Falha ao realizar commit${NC}" >&2
-    echo -e "  Log gravado em: ${BOLD}$LOG_PATH${NC}" >&2
-    exit 1
+    run_large_files_flow || rc=$?
   fi
+  
+  case $rc in
+    1) exit 1 ;;
+  esac
 }
 
 # Executa

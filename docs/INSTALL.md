@@ -206,6 +206,19 @@ commitia --provider openai
 
 Normalmente a CLI não está autenticada. Veja a resposta bruta no log gravado em `.commitia/logs/` e faça login (`cursor-agent login`, `copilot login`, `claude auth login`, `codex login`). Para `gemini-cli`, defina `GEMINI_API_KEY`.
 
+### Erros com lockfiles ou arquivos muito grandes (pnpm-lock, package-lock, yarn.lock...)
+
+O CommitIA já trata esses casos sozinho: commita primeiro os arquivos pequenos e depois cada arquivo grande em commit separado. Se a IA falhar com o diff completo, ele usa um fallback (nome, linhas alteradas e contexto resumido) e, por último, uma mensagem padrão (`chore(deps): atualiza <lockfile>`). Ajuste a detecção no `.commitiarc`:
+
+```bash
+COMMITIA_LARGE_FILES="true"          # false desativa o tratamento
+COMMITIA_LARGE_FILE_LINES="1000"     # linhas alteradas (0 desativa)
+COMMITIA_LARGE_FILE_BYTES="100000"   # bytes do diff/binário (0 desativa)
+COMMITIA_LARGE_FILE_PATTERNS="pnpm-lock.yaml yarn.lock *.lock"  # globs; substitui a lista padrão
+```
+
+Veja os detalhes na seção "Arquivos grandes" do [README](../README.md).
+
 ### Permissão negada
 
 ```bash

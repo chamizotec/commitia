@@ -31,6 +31,32 @@
 # COMMITIA_AUTO_STAGE="true"
 
 # ----------------------------------------------------------------------------
+# Arquivos grandes (lockfiles e diffs muito grandes)
+# ----------------------------------------------------------------------------
+# Lockfiles (pnpm-lock.yaml, package-lock.json, yarn.lock...) e arquivos com diff
+# muito grande são commitados separadamente: primeiro os pequenos, depois cada
+# arquivo grande. Se a IA falhar com o diff completo, o commitia envia só o nome,
+# as linhas alteradas, um contexto resumido e o último commit da sessão (commit
+# criado nesta execução; o da branch não é usado). Em último caso, ou se ainda não
+# houve commit na sessão, usa "chore(deps): atualiza <lockfile>".
+#
+# Ativa/desativa o tratamento (padrão: true):
+# COMMITIA_LARGE_FILES="true"
+# Linhas alteradas (git diff --staged --numstat) a partir das quais o arquivo é
+# grande; 0 desativa o critério (padrão: 1000):
+# COMMITIA_LARGE_FILE_LINES="1000"
+# Bytes do diff (ou do binário) a partir dos quais o arquivo é grande;
+# 0 desativa o critério (padrão: 100000):
+# COMMITIA_LARGE_FILE_BYTES="100000"
+# Globs (separados por espaço ou vírgula) de arquivos sempre tratados como grandes.
+# SUBSTITUI a lista padrão de lockfiles; "" desativa a detecção por nome.
+# Padrão: pnpm-lock.yaml package-lock.json npm-shrinkwrap.json yarn.lock bun.lock
+#   bun.lockb composer.lock Cargo.lock poetry.lock Pipfile.lock Gemfile.lock go.sum
+#   mix.lock pubspec.lock Podfile.lock Package.resolved flake.lock packages.lock.json
+#   deno.lock uv.lock pdm.lock gradle.lockfile *.lock *-lock.json *-lock.yaml *.lockb
+# COMMITIA_LARGE_FILE_PATTERNS="pnpm-lock.yaml yarn.lock *.lock"
+
+# ----------------------------------------------------------------------------
 # Configurações específicas de provedores
 # ----------------------------------------------------------------------------
 

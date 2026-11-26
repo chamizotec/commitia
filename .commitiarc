@@ -4,8 +4,5 @@
 # Provedor de IA para desenvolvimento
 COMMITIA_PROVIDER="copilot"
 
-export GEMINI_API_KEY="AIzaSyCbQbeQJXmFaD4sQjX5ezRimGLr6WfkaWw"
-export COMMITIA_GEMINI_MODEL="gemini-2.0-flash"
-
 # Idioma padrão
 COMMITIA_LANGUAGE="pt"
