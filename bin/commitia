@@ -194,7 +194,7 @@ print_help() {
   echo "  -d, --dry-run            Apenas mostra a mensagem sem fazer commit"
   echo "  -a, --amend              Altera o último commit"
   echo "  --no-stage               Não adiciona arquivos ao stage automaticamente"
-  echo "  --provider <provider>    Define o provedor de IA (amp, openai, gemini, ollama)"
+  echo "  --provider <provider>    Define o provedor de IA (amp, openai, gemini, ollama, cursor, copilot, claude, codex, gemini-cli)"
   echo "  --lang <idioma>          Idioma da mensagem (pt, en, es)"
   echo "  --update                 Atualiza para a versão mais recente"
   echo "  --force                  Força atualização (usar com --update)"
@@ -228,7 +228,9 @@ print_help() {
   echo "    2. ~/.commitiarc (global)"
   echo ""
   echo "  Variáveis disponíveis:"
-  echo "    - COMMITIA_PROVIDER: amp, openai, gemini, ollama (padrão: amp)"
+  echo "    - COMMITIA_PROVIDER: amp, openai, gemini, ollama, cursor, copilot, claude, codex, gemini-cli (padrão: amp)"
+  echo "    - COMMITIA_CLI_TIMEOUT: tempo máximo em segundos das CLIs de IA (padrão: 120)"
+  echo "    - COMMITIA_<CLI>_MODEL: modelo opcional (CURSOR, COPILOT, CLAUDE, CODEX, GEMINI_CLI)"
   echo "    - COMMITIA_LANGUAGE: pt, en, es (padrão: pt)"
   echo "    - COMMITIA_AUTO_STAGE: true, false (padrão: true)"
   echo ""
@@ -300,6 +302,31 @@ check_dependencies() {
       fi
       if [ "$HAS_JQ" = false ]; then
         warn "jq não encontrado; usando grep/sed (recomendado: brew install jq)"
+      fi
+      ;;
+    cursor)
+      if ! command -v cursor-agent &>/dev/null; then
+        error "cursor-agent não encontrado. Instale com: curl https://cursor.com/install -fsS | bash"
+      fi
+      ;;
+    copilot)
+      if ! command -v copilot &>/dev/null; then
+        error "copilot CLI não encontrado. Instale com: npm install -g @github/copilot"
+      fi
+      ;;
+    claude)
+      if ! command -v claude &>/dev/null; then
+        error "claude CLI não encontrado. Instale com: npm install -g @anthropic-ai/claude-code"
+      fi
+      ;;
+    codex)
+      if ! command -v codex &>/dev/null; then
+        error "codex CLI não encontrado. Instale com: npm install -g @openai/codex"
+      fi
+      ;;
+    gemini-cli)
+      if ! command -v gemini &>/dev/null; then
+        error "gemini CLI não encontrado. Instale com: npm install -g @google/gemini-cli"
       fi
       ;;
     *)
@@ -525,6 +552,113 @@ generate_with_amp() {
   echo "$prompt" | amp -x --dangerously-allow-all 2>&1
 }
 
+# ----------------------------------------------------------------------------
+# Provedores baseados em CLIs de IA (cursor, copilot, claude, codex, gemini-cli)
+#
+# O diff é enviado no prompt e as ferramentas dos agentes ficam desligadas
+# (somente leitura / sem permissões). Nenhuma flag "allow all" é usada.
+# ----------------------------------------------------------------------------
+
+# Tempo máximo (segundos) de espera por uma CLI de IA
+COMMITIA_CLI_TIMEOUT="${COMMITIA_CLI_TIMEOUT:-120}"
+# Tamanho máximo (caracteres) do diff enviado às CLIs de IA
+COMMITIA_MAX_DIFF_CHARS="${COMMITIA_MAX_DIFF_CHARS:-60000}"
+
+# Executa um comando com timeout (se timeout/gtimeout existir no sistema)
+run_with_timeout() {
+  if command -v timeout &>/dev/null; then
+    timeout "$COMMITIA_CLI_TIMEOUT" "$@"
+  elif command -v gtimeout &>/dev/null; then
+    gtimeout "$COMMITIA_CLI_TIMEOUT" "$@"
+  else
+    "$@"
+  fi
+}
+
+# Monta o prompt completo (instruções + diff) para as CLIs de IA
+build_cli_prompt() {
+  local prompt="$1"
+  local diff
+  diff=$(get_staged_diff)
+
+  if [ ${#diff} -gt "$COMMITIA_MAX_DIFF_CHARS" ]; then
+    diff="${diff:0:$COMMITIA_MAX_DIFF_CHARS}"$'\n'"... [diff truncado]"
+  fi
+
+  printf '%s\n\nO diff das alterações já está abaixo. NÃO execute comandos, NÃO leia arquivos e NÃO edite nada.\n\nDiff:\n%s\n' "$prompt" "$diff"
+}
+
+generate_with_cursor() {
+  local full_prompt
+  full_prompt=$(build_cli_prompt "$1")
+
+  # --mode ask: somente leitura (sem edições nem comandos)
+  local args=(-p --mode ask --output-format text)
+  [ -n "$COMMITIA_CURSOR_MODEL" ] && args+=(--model "$COMMITIA_CURSOR_MODEL")
+
+  run_with_timeout cursor-agent "${args[@]}" "$full_prompt" 2>&1 </dev/null || true
+}
+
+generate_with_copilot() {
+  local full_prompt
+  full_prompt=$(build_cli_prompt "$1")
+
+  # -s: apenas a resposta; --deny-tool: bloqueia shell e escrita de arquivos
+  local args=(-s --no-color --no-ask-user --no-custom-instructions --no-auto-update
+    --disable-builtin-mcps --deny-tool=shell --deny-tool=write)
+  [ -n "$COMMITIA_COPILOT_MODEL" ] && args+=(--model "$COMMITIA_COPILOT_MODEL")
+
+  run_with_timeout copilot "${args[@]}" -p "$full_prompt" 2>&1 </dev/null || true
+}
+
+generate_with_claude() {
+  local full_prompt
+  full_prompt=$(build_cli_prompt "$1")
+
+  # --tools "": nenhuma ferramenta disponível
+  local args=(-p --tools "" --disable-slash-commands --strict-mcp-config
+    --no-session-persistence --output-format text)
+  [ -n "$COMMITIA_CLAUDE_MODEL" ] && args+=(--model "$COMMITIA_CLAUDE_MODEL")
+
+  printf '%s' "$full_prompt" | run_with_timeout claude "${args[@]}" 2>&1 || true
+}
+
+generate_with_codex() {
+  local full_prompt
+  full_prompt=$(build_cli_prompt "$1")
+
+  # -o: grava somente a última mensagem do agente (evita logs/banners do stderr)
+  local out_file out
+  out_file=$(mktemp)
+
+  local args=(exec --skip-git-repo-check --ephemeral --sandbox read-only --color never
+    -o "$out_file")
+  [ -n "$COMMITIA_CODEX_MODEL" ] && args+=(--model "$COMMITIA_CODEX_MODEL")
+
+  out=$(printf '%s' "$full_prompt" | run_with_timeout codex "${args[@]}" - 2>&1) || true
+
+  if [ -s "$out_file" ]; then
+    cat "$out_file"
+  else
+    # Falha: devolve só o final da saída (erro) para o log
+    echo "$out" | tail -n 20
+  fi
+  rm -f "$out_file"
+}
+
+generate_with_gemini_cli() {
+  local full_prompt
+  full_prompt=$(build_cli_prompt "$1")
+
+  # --approval-mode plan: somente leitura; o prompt completo vai via stdin
+  # --skip-trust: necessário no modo headless em pastas ainda não confiáveis
+  local args=(--approval-mode plan --skip-trust -o text)
+  [ -n "$COMMITIA_GEMINI_CLI_MODEL" ] && args+=(--model "$COMMITIA_GEMINI_CLI_MODEL")
+
+  printf '%s' "$full_prompt" | run_with_timeout gemini "${args[@]}" \
+    -p "Responda APENAS com a mensagem de commit pedida acima, sem explicações." 2>&1 || true
+}
+
 generate_with_openai() {
   local prompt="$1"
   local diff
@@ -675,11 +809,34 @@ generate_commit_message() {
     ollama)
       output=$(generate_with_ollama "$prompt")
       ;;
+    cursor)
+      output=$(generate_with_cursor "$prompt")
+      ;;
+    copilot)
+      output=$(generate_with_copilot "$prompt")
+      ;;
+    claude)
+      output=$(generate_with_claude "$prompt")
+      ;;
+    codex)
+      output=$(generate_with_codex "$prompt")
+      ;;
+    gemini-cli)
+      output=$(generate_with_gemini_cli "$prompt")
+      ;;
   esac
   
+  # Guarda a saída bruta (com ANSI/banners) para o log de erro
   COMMITIA_RAW_OUTPUT="$output"
+  # generate_commit_message roda em subshell ($(...)); persiste a saída bruta em arquivo
+  if [ -n "$COMMITIA_RAW_FILE" ]; then
+    printf '%s' "$output" > "$COMMITIA_RAW_FILE"
+  fi
   
-  # Extrai a mensagem no formato correto
+  # Remove sequências ANSI (cores, cursor) e retornos de carro da saída das CLIs
+  output=$(printf '%s\n' "$output" | perl -pe 's/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(\a|\e\\)//g; s/\r//g')
+  
+  # Extrai a mensagem no formato correto (ignora banners e outras linhas)
   local msg
   msg=$(echo "$output" | grep -oE '(feat|fix|docs|style|refactor|test|chore|perf|ci|build|revert)\([^)]*\):.*' | head -1)
   
@@ -851,7 +1008,10 @@ main() {
   
   # Gera a mensagem
   info "Gerando mensagem com IA ($AI_PROVIDER)..."
+  COMMITIA_RAW_FILE=$(mktemp)
   COMMIT_MSG=$(generate_commit_message "$PROMPT")
+  COMMITIA_RAW_OUTPUT=$(cat "$COMMITIA_RAW_FILE" 2>/dev/null || true)
+  rm -f "$COMMITIA_RAW_FILE"
   
   if [ -z "$COMMIT_MSG" ]; then
     LOG_PATH=$(write_error_log \

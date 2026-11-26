@@ -8,7 +8,7 @@
 # ----------------------------------------------------------------------------
 # Provedor de IA
 # ----------------------------------------------------------------------------
-# Opções: amp, openai, gemini, ollama
+# Opções: amp, openai, gemini, ollama, cursor, copilot, claude, codex, gemini-cli
 # Padrão: amp
 #
 # COMMITIA_PROVIDER="amp"
@@ -54,4 +54,26 @@
 # amp CLI
 # -------
 # Instale o amp CLI seguindo as instruções em: https://ampcode.com
+
+# CLIs de IA (cursor, copilot, claude, codex, gemini-cli)
+# -------------------------------------------------------
+# O diff é enviado no prompt e as ferramentas das CLIs ficam desligadas.
+# Instale e faça login uma vez (o login abre o navegador):
+#
+#   cursor      -> curl https://cursor.com/install -fsS | bash ; cursor-agent login
+#   copilot     -> npm install -g @github/copilot ; copilot login
+#   claude      -> npm install -g @anthropic-ai/claude-code ; claude auth login
+#   codex       -> npm install -g @openai/codex ; codex login
+#   gemini-cli  -> npm install -g @google/gemini-cli ; export GEMINI_API_KEY="sua-chave"
+#
+# Tempo máximo de espera por resposta, em segundos (padrão: 120):
+# COMMITIA_CLI_TIMEOUT="120"
+# Limite de caracteres do diff enviado (padrão: 60000):
+# COMMITIA_MAX_DIFF_CHARS="60000"
+# Modelo opcional por CLI (padrão: o da própria CLI):
+# COMMITIA_CURSOR_MODEL=""
+# COMMITIA_COPILOT_MODEL=""
+# COMMITIA_CLAUDE_MODEL=""
+# COMMITIA_CODEX_MODEL=""
+# COMMITIA_GEMINI_CLI_MODEL=""
 

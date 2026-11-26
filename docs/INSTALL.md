@@ -45,6 +45,34 @@ curl -fsSL https://ollama.ai/install.sh | sh
 ollama pull codellama
 ```
 
+#### Opção 4: CLIs de IA (Cursor, Copilot, Claude Code, Codex, Gemini CLI)
+
+Cada CLI é um provedor (`cursor`, `copilot`, `claude`, `codex`, `gemini-cli`). Instale e faça login uma vez:
+
+```bash
+# Cursor
+curl https://cursor.com/install -fsS | bash
+cursor-agent login
+
+# GitHub Copilot
+npm install -g @github/copilot
+copilot login
+
+# Claude Code
+npm install -g @anthropic-ai/claude-code
+claude auth login
+
+# Codex
+npm install -g @openai/codex
+codex login
+
+# Gemini CLI (o login pessoal com conta Google foi descontinuado; use API key)
+npm install -g @google/gemini-cli
+export GEMINI_API_KEY="sua-chave"  # https://aistudio.google.com/apikey
+```
+
+Depois use, por exemplo: `commitia --provider claude`.
+
 ## Instalação
 
 ### macOS / Linux
@@ -173,6 +201,10 @@ Instale o amp CLI ou configure outro provedor:
 export OPENAI_API_KEY="sua-chave"
 commitia --provider openai
 ```
+
+### "Não foi possível gerar a mensagem de commit" com uma CLI de IA
+
+Normalmente a CLI não está autenticada. Veja a resposta bruta no log gravado em `.commitia/logs/` e faça login (`cursor-agent login`, `copilot login`, `claude auth login`, `codex login`). Para `gemini-cli`, defina `GEMINI_API_KEY`.
 
 ### Permissão negada
 

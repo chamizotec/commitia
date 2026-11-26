@@ -13,7 +13,7 @@ CommitIA analisa suas alterações no Git e gera automaticamente mensagens de co
 - 🎯 **Mensagens semânticas** - Segue o padrão Conventional Commits automaticamente
 - 🔍 **Detecção de escopo** - Extrai automaticamente IDs de tarefas da branch (JIRA, etc.)
 - 🌍 **Multi-idioma** - Suporte para português, inglês e espanhol
-- 🤖 **Múltiplos provedores de IA** - Compatível com amp CLI, OpenAI e Ollama
+- 🤖 **Múltiplos provedores de IA** - Compatível com amp CLI, OpenAI, Gemini, Ollama e as CLIs do Cursor, GitHub Copilot, Claude Code, Codex e Gemini
 - 🎨 **Interface amigável** - Cores, feedback claro e modo interativo
 - ⚡ **Rápido e leve** - Script bash sem dependências pesadas
 
@@ -125,7 +125,7 @@ commitia -a
 Crie `~/.commitiarc`:
 
 ```bash
-# Provedor de IA (amp, openai, ollama)
+# Provedor de IA (amp, openai, gemini, ollama, cursor, copilot, claude, codex, gemini-cli)
 COMMITIA_PROVIDER="amp"
 
 # Idioma das mensagens (pt, en, es)
@@ -191,6 +191,35 @@ Instale o [Ollama](https://ollama.ai) e baixe um modelo:
 ollama pull codellama
 commitia --provider ollama
 ```
+
+### CLIs de IA (Cursor, Copilot, Claude Code, Codex, Gemini CLI)
+
+Cada CLI tem um provedor próprio. O diff é enviado no prompt e as ferramentas do agente ficam desligadas (somente leitura, sem executar comandos nem editar arquivos). Instale a CLI, faça login uma vez e use `--provider`:
+
+| Provedor     | Instalação                                      | Login                                       |
+| ------------ | ----------------------------------------------- | ------------------------------------------- |
+| `cursor`     | `curl https://cursor.com/install -fsS \| bash`  | `cursor-agent login`                        |
+| `copilot`    | `npm install -g @github/copilot`                | `copilot login`                             |
+| `claude`     | `npm install -g @anthropic-ai/claude-code`      | `claude auth login`                         |
+| `codex`      | `npm install -g @openai/codex`                  | `codex login`                               |
+| `gemini-cli` | `npm install -g @google/gemini-cli`             | `export GEMINI_API_KEY="sua-chave"` (*)     |
+
+(*) O login pessoal com conta Google do Gemini CLI foi descontinuado; use uma API key do [Google AI Studio](https://aistudio.google.com/apikey).
+
+```bash
+commitia --provider claude
+commitia --provider gemini-cli
+```
+
+Variáveis opcionais (no `.commitiarc` ou no ambiente):
+
+```bash
+COMMITIA_CLI_TIMEOUT="120"        # tempo máximo (s) de espera pela CLI
+COMMITIA_MAX_DIFF_CHARS="60000"   # limite de caracteres do diff enviado
+COMMITIA_CLAUDE_MODEL="sonnet"    # modelo (CURSOR, COPILOT, CLAUDE, CODEX, GEMINI_CLI)
+```
+
+> O provedor `gemini` usa a API REST; `gemini-cli` usa a CLI `gemini`.
 
 ## 🔄 Integração com branches
 

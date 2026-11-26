@@ -92,6 +92,31 @@ check_dependencies() {
     has_provider=true
   fi
   
+  if command -v cursor-agent &>/dev/null; then
+    success "Cursor CLI (cursor-agent) encontrado"
+    has_provider=true
+  fi
+  
+  if command -v copilot &>/dev/null; then
+    success "GitHub Copilot CLI encontrado"
+    has_provider=true
+  fi
+  
+  if command -v claude &>/dev/null; then
+    success "Claude Code encontrado"
+    has_provider=true
+  fi
+  
+  if command -v codex &>/dev/null; then
+    success "Codex CLI encontrado"
+    has_provider=true
+  fi
+  
+  if command -v gemini &>/dev/null; then
+    success "Gemini CLI encontrado"
+    has_provider=true
+  fi
+  
   if [ -n "$OPENAI_API_KEY" ]; then
     success "OpenAI API key configurada"
     has_provider=true
@@ -116,6 +141,11 @@ check_dependencies() {
     echo "  • OpenAI: Configure OPENAI_API_KEY"
     echo "  • Gemini: Configure GEMINI_API_KEY (https://aistudio.google.com/apikey)"
     echo "  • Ollama: https://ollama.ai"
+    echo "  • Cursor CLI: curl https://cursor.com/install -fsS | bash"
+    echo "  • GitHub Copilot CLI: npm install -g @github/copilot"
+    echo "  • Claude Code: npm install -g @anthropic-ai/claude-code"
+    echo "  • Codex CLI: npm install -g @openai/codex"
+    echo "  • Gemini CLI: npm install -g @google/gemini-cli"
     echo ""
     
     # Se está via pipe, não pode ler input, então continua
@@ -213,7 +243,7 @@ create_config_example() {
 # Configuração do CommitIA
 # Copie este arquivo para ~/.commitiarc
 
-# Provedor de IA (amp, openai, ollama)
+# Provedor de IA (amp, openai, gemini, ollama, cursor, copilot, claude, codex, gemini-cli)
 # COMMITIA_PROVIDER="amp"
 
 # Idioma das mensagens (pt, en, es)
