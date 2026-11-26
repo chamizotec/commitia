@@ -219,6 +219,22 @@ COMMITIA_LARGE_FILE_PATTERNS="pnpm-lock.yaml yarn.lock *.lock"  # globs; substit
 
 Veja os detalhes na seção "Arquivos grandes" do [README](../README.md).
 
+### "a CLI '...' precisa ser atualizada"
+
+O commitia confere, antes de gerar a mensagem, se a CLI instalada lista no `--help` as flags que ele usa (por exemplo, `--mode` no `cursor-agent`). Se faltar alguma, atualize a CLI:
+
+| Provedor     | Capacidades exigidas (principais)                         | Comando de atualização                                                  |
+| ------------ | --------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `cursor`     | `--print`, `--output-format`, `--mode`                    | `cursor-agent update`                                                   |
+| `copilot`    | `--prompt`, `--silent`, `--deny-tool`, `--no-ask-user`    | `npm install -g @github/copilot@latest` (ou `copilot update`)           |
+| `claude`     | `--print`, `--tools`, `--strict-mcp-config`               | `npm install -g @anthropic-ai/claude-code@latest` (ou `claude update`)  |
+| `codex`      | `exec` com `--ephemeral`, `--sandbox`, `--output-last-message` | `npm install -g @openai/codex@latest` (ou `codex update`)          |
+| `gemini-cli` | `--approval-mode`, `--skip-trust`, `--prompt`             | `npm install -g @google/gemini-cli@latest`                              |
+
+A lista completa de flags por CLI está no [README](../README.md#versões-e-capacidades-exigidas-das-clis). Não há versão mínima fixa: a validação é por capacidade. O mesmo aviso aparece se a CLI responder `unknown option` em tempo de execução.
+
+Para pular a validação preventiva: `export COMMITIA_SKIP_CLI_VERSION_CHECK=true` (ou no `.commitiarc`).
+
 ### Permissão negada
 
 ```bash

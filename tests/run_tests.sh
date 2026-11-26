@@ -110,6 +110,49 @@ test_dry_run() {
 # Provedores de CLIs de IA (hermético: git e CLIs falsos em diretório temporário)
 # ----------------------------------------------------------------------------
 
+# Texto de '--help' de uma CLI falsa atualizada: lista todas as flags que o commitia usa.
+# Se o 2º argumento (flag) for informado, remove essa flag do texto (simula versão antiga).
+# O cursor-agent lista também --model, para provar que --mode não casa com --model.
+fake_help_text() {
+  fake_help_full "$1" | perl -pe "s/(?<![\\w-])\\Q${2:-__nenhuma__}\\E(?![\\w-])//g"
+}
+
+fake_help_full() {
+  case "$1" in
+    cursor-agent)
+      echo "Usage: agent [options]"
+      echo "  -p, --print              Print responses"
+      echo "  --output-format <format> text | json"
+      echo "  --mode <mode>            plan | ask"
+      echo "  --model <model>          Model to use"
+      ;;
+    copilot)
+      echo "Usage: copilot [OPTIONS]"
+      echo "  -p, --prompt <text>"
+      echo "  -s, --silent"
+      echo "  --no-color --no-ask-user --no-custom-instructions"
+      echo "  --no-auto-update --disable-builtin-mcps"
+      echo "  --deny-tool [<tools>...]"
+      ;;
+    claude)
+      echo "Usage: claude [options]"
+      echo "  -p, --print"
+      echo "  --tools <tools...>  --disable-slash-commands  --strict-mcp-config"
+      echo "  --no-session-persistence"
+      echo "  --output-format <format>"
+      ;;
+    codex)
+      echo "Usage: codex exec [OPTIONS]"
+      echo "  --skip-git-repo-check  --ephemeral  -s, --sandbox <MODE>"
+      echo "  --color <COLOR>  -o, --output-last-message <FILE>"
+      ;;
+    gemini)
+      echo "Usage: gemini [options]"
+      echo "  -p, --prompt  --approval-mode  --skip-trust  -o, --output-format"
+      ;;
+  esac
+}
+
 # Cria git falso e CLIs falsas (respondem com ANSI + banner + mensagem)
 setup_fake_env() {
   FAKE_DIR=$(mktemp -d)
@@ -129,9 +172,21 @@ EOF
 
   local cli
   for cli in cursor-agent copilot claude codex gemini; do
+    # --help da CLI falsa "atualizada" (arquivo ao lado do executável)
+    fake_help_text "$cli" > "$FAKE_DIR/cli/$cli.help"
     cat > "$FAKE_DIR/cli/$cli" << 'EOF'
 #!/usr/bin/env bash
+# --version / --help não consomem stdin nem geram mensagem
+case "$*" in
+  *--version*) echo "1.2.3 (fake)"; exit 0 ;;
+  *--help*) cat "$0.help"; exit 0 ;;
+esac
 cat > /dev/null 2>&1 || true
+# Simula uma CLI antiga que rejeita flags novas em tempo de execução
+if [ -n "$FAKE_RUNTIME_ERROR" ]; then
+  echo "error: unknown option '--mode' (Did you mean --model?)" >&2
+  exit 1
+fi
 out=""; prev=""
 for a in "$@"; do
   [ "$prev" = "-o" ] && [ "$a" != "text" ] && out="$a"
@@ -208,11 +263,22 @@ setup_large_env() {
   mkdir -p "$LG_DIR/bin" "$LG_DIR/home" "$LG_DIR/out" "$LG_DIR/repo"
   LG_REPO="$LG_DIR/repo"
 
+  fake_help_text claude > "$LG_DIR/bin/claude.help"
   cat > "$LG_DIR/bin/claude" << 'EOF2'
 #!/usr/bin/env bash
+# --version / --help (validação de versão): não gravam prompt
+case "$*" in
+  *--version*) echo "1.2.3 (fake)"; exit 0 ;;
+  *--help*) cat "$0.help"; exit 0 ;;
+esac
 prompt=$(cat)
 n=$(ls "$FAKE_OUT" 2>/dev/null | wc -l | tr -d ' ')
 printf '%s' "$prompt" > "$FAKE_OUT/prompt-$((n + 1)).txt"
+# Simula CLI antiga: rejeita a flag em tempo de execução (prompt casando com FAKE_RUNTIME_ERROR)
+if [ -n "$FAKE_RUNTIME_ERROR" ] && printf '%s' "$prompt" | grep -qE "$FAKE_RUNTIME_ERROR"; then
+  echo "error: unknown option '--tools' (Did you mean --tool?)" >&2
+  exit 1
+fi
 if [ -n "$FAKE_FAIL_MATCH" ] \
   && printf '%s' "$prompt" | grep -qE "$FAKE_FAIL_MATCH" \
   && printf '%s' "$prompt" | grep -qE "${FAKE_FAIL_MATCH2:-.}"; then
@@ -248,7 +314,7 @@ lg_commitia() {
       *) break ;;
     esac
   done
-  LG_OUT=$( (cd "$LG_REPO" && env -u FAKE_FAIL_MATCH -u FAKE_FAIL_MATCH2 -u COMMITIA_LARGE_FILES -u COMMITIA_LARGE_FILE_LINES \
+  LG_OUT=$( (cd "$LG_REPO" && env -u FAKE_FAIL_MATCH -u FAKE_FAIL_MATCH2 -u FAKE_RUNTIME_ERROR -u COMMITIA_LARGE_FILES -u COMMITIA_LARGE_FILE_LINES \
     -u COMMITIA_LARGE_FILE_BYTES -u COMMITIA_LARGE_FILE_PATTERNS \
     HOME="$LG_DIR/home" PATH="$LG_DIR/bin:$PATH" FAKE_OUT="$LG_DIR/out" \
     ${envs[@]+"${envs[@]}"} "$COMMITIA" --provider claude "$@" 2>&1; echo "RC=$?") | perl -pe 's/\e\[[0-9;]*m//g')
@@ -633,8 +699,13 @@ test_large_unborn_repo() {
   LG_DIR=$(mktemp -d)
   mkdir -p "$LG_DIR/bin" "$LG_DIR/home" "$LG_DIR/out" "$LG_DIR/repo"
   LG_REPO="$LG_DIR/repo"
+  fake_help_text claude > "$LG_DIR/bin/claude.help"
   cat > "$LG_DIR/bin/claude" << 'EOF2'
 #!/usr/bin/env bash
+case "$*" in
+  *--version*) echo "1.2.3 (fake)"; exit 0 ;;
+  *--help*) cat "$0.help"; exit 0 ;;
+esac
 cat > /dev/null
 echo "feat(app): adiciona recurso"
 EOF2
@@ -649,6 +720,117 @@ EOF2
   expect_eq "Repo sem commits: 2 commits criados" "$(lg_count)" "2"
   expect_eq "Repo sem commits: lockfile no último" "$(lg_files 0)" "pnpm-lock.yaml"
   expect_eq "Repo sem commits: pequeno no primeiro" "$(lg_files 1)" "app.sh"
+  teardown_large_env
+}
+
+# ----------------------------------------------------------------------------
+# Validação de versão das CLIs (CLI antiga, erro em tempo de execução, CLI atualizada)
+# ----------------------------------------------------------------------------
+
+# Dados de cada provedor: binário, flag exigida (removida do --help para simular
+# versão antiga) e trecho do comando de atualização
+cli_case() {
+  case "$1" in
+    cursor) CASE_BIN="cursor-agent"; CASE_FLAG="--mode"; CASE_UPDATE="cursor-agent update" ;;
+    copilot) CASE_BIN="copilot"; CASE_FLAG="--deny-tool"; CASE_UPDATE="npm install -g @github/copilot@latest" ;;
+    claude) CASE_BIN="claude"; CASE_FLAG="--tools"; CASE_UPDATE="npm install -g @anthropic-ai/claude-code@latest" ;;
+    codex) CASE_BIN="codex"; CASE_FLAG="--output-last-message"; CASE_UPDATE="npm install -g @openai/codex@latest" ;;
+    gemini-cli) CASE_BIN="gemini"; CASE_FLAG="--skip-trust"; CASE_UPDATE="npm install -g @google/gemini-cli@latest" ;;
+  esac
+}
+
+strip_ansi() { perl -pe 's/\e\[[0-9;]*m//g'; }
+
+# (a) CLI antiga (sem a flag no --help): aborta antes de gerar, com mensagem de atualização
+test_cli_outdated_preventive() {
+  setup_fake_env
+  cd "$FAKE_DIR/repo"
+  local provider out rc
+  for provider in cursor copilot claude codex gemini-cli; do
+    cli_case "$provider"
+    fake_help_text "$CASE_BIN" "$CASE_FLAG" > "$FAKE_DIR/cli/$CASE_BIN.help"
+    rc=0
+    out=$(PATH="$FAKE_DIR/git:$FAKE_DIR/cli:$PATH" $COMMITIA -d --provider "$provider" 2>&1 | strip_ansi; exit "${PIPESTATUS[0]}") || rc=$?
+    expect_eq "CLI antiga ($provider): aborta com erro" "$([ "$rc" -ne 0 ] && echo sim)" "sim"
+    expect_contains "CLI antiga ($provider): pede atualização" "$out" "precisa ser atualizada"
+    expect_contains "CLI antiga ($provider): informa a flag ausente" "$out" "$CASE_FLAG"
+    expect_contains "CLI antiga ($provider): informa a versão instalada" "$out" "1.2.3"
+    expect_contains "CLI antiga ($provider): informa o comando de atualização" "$out" "$CASE_UPDATE"
+    expect_not_contains "CLI antiga ($provider): aborta antes de gerar" "$out" "Gerando mensagem"
+    expect_not_contains "CLI antiga ($provider): sem erro cru" "$out" "unknown option"
+
+    # Variável para pular a checagem: segue normalmente
+    out=$(PATH="$FAKE_DIR/git:$FAKE_DIR/cli:$PATH" COMMITIA_SKIP_CLI_VERSION_CHECK=true \
+      $COMMITIA -d --provider "$provider" 2>&1 | strip_ansi || true)
+    expect_contains "CLI antiga ($provider): COMMITIA_SKIP_CLI_VERSION_CHECK pula a checagem" "$out" "feat(app): adiciona novo recurso"
+  done
+  cd - > /dev/null
+  rm -rf "$FAKE_DIR"
+}
+
+# (b) CLI que falha em tempo de execução com "unknown option": mensagem de atualização
+test_cli_outdated_runtime() {
+  setup_fake_env
+  cd "$FAKE_DIR/repo"
+  local provider out rc
+  for provider in cursor copilot claude codex gemini-cli; do
+    cli_case "$provider"
+    rm -rf "$FAKE_REPO/.commitia"
+    rc=0
+    out=$(PATH="$FAKE_DIR/git:$FAKE_DIR/cli:$PATH" FAKE_RUNTIME_ERROR=1 \
+      $COMMITIA -d --provider "$provider" 2>&1 | strip_ansi; exit "${PIPESTATUS[0]}") || rc=$?
+    expect_eq "Erro em runtime ($provider): sai com erro" "$rc" "1"
+    expect_contains "Erro em runtime ($provider): pede atualização" "$out" "precisa ser atualizada"
+    expect_contains "Erro em runtime ($provider): comando de atualização" "$out" "$CASE_UPDATE"
+    expect_not_contains "Erro em runtime ($provider): sem mensagem genérica" "$out" "Não foi possível gerar"
+    expect_not_contains "Erro em runtime ($provider): sem erro cru" "$out" "error: unknown option"
+    expect_eq "Erro em runtime ($provider): log mantém a saída bruta" \
+      "$(grep -rl "unknown option" "$FAKE_REPO/.commitia/logs" 2>/dev/null | wc -l | tr -d ' ')" "1"
+  done
+  cd - > /dev/null
+  rm -rf "$FAKE_DIR"
+}
+
+# (c) CLI atualizada: segue normalmente, sem aviso de atualização
+test_cli_up_to_date() {
+  setup_fake_env
+  cd "$FAKE_DIR/repo"
+  local provider out
+  for provider in cursor copilot claude codex gemini-cli; do
+    out=$(PATH="$FAKE_DIR/git:$FAKE_DIR/cli:$PATH" $COMMITIA -d --provider "$provider" 2>&1 | strip_ansi || true)
+    expect_not_contains "CLI atualizada ($provider): sem aviso de atualização" "$out" "precisa ser atualizada"
+    expect_contains "CLI atualizada ($provider): gera a mensagem" "$out" "feat(app): adiciona novo recurso"
+  done
+  cd - > /dev/null
+  rm -rf "$FAKE_DIR"
+}
+
+# Fluxo de arquivos grandes: erro de flag na 1ª tentativa aborta sem fallback nem commits
+test_cli_outdated_large_files_first_attempt() {
+  large_tests_available || return 0
+  setup_large_env
+  echo 'echo a' > "$LG_REPO/app.sh"
+  lg_make_lock pnpm-lock.yaml 30
+  lg_commitia FAKE_RUNTIME_ERROR='.'
+  expect_eq "Arquivos grandes + CLI antiga: sai com erro" "$LG_RC" "1"
+  expect_contains "Arquivos grandes + CLI antiga: pede atualização" "$LG_OUT" "precisa ser atualizada"
+  expect_not_contains "Arquivos grandes + CLI antiga: sem último recurso" "$LG_OUT" "último recurso"
+  expect_eq "Arquivos grandes + CLI antiga: nenhum commit criado" "$(lg_count)" "1"
+  expect_eq "Arquivos grandes + CLI antiga: uma única chamada (sem loop)" "$(lg_nprompts)" "1"
+  teardown_large_env
+}
+
+# Fluxo de arquivos grandes: erro de flag no fallback (resumo) avisa em vez de usar o último recurso
+test_cli_outdated_large_files_summary_fallback() {
+  large_tests_available || return 0
+  setup_large_env
+  echo 'echo a' > "$LG_REPO/app.sh"
+  lg_make_lock pnpm-lock.yaml 30
+  lg_commitia FAKE_FAIL_MATCH='^Diff:' FAKE_FAIL_MATCH2='pnpm-lock' FAKE_RUNTIME_ERROR='^Resumo:'
+  expect_eq "Fallback + CLI antiga: sai com erro" "$LG_RC" "1"
+  expect_contains "Fallback + CLI antiga: pede atualização" "$LG_OUT" "precisa ser atualizada"
+  expect_not_contains "Fallback + CLI antiga: não cai no último recurso" "$LG_OUT" "mensagem padrão de último recurso"
+  expect_eq "Fallback + CLI antiga: só o commit dos pequenos" "$(lg_count)" "2"
   teardown_large_env
 }
 
@@ -670,6 +852,11 @@ test_dry_run
 test_unknown_provider
 test_cli_provider_missing_binary
 test_cli_provider_generates_message
+test_cli_outdated_preventive
+test_cli_outdated_runtime
+test_cli_up_to_date
+test_cli_outdated_large_files_first_attempt
+test_cli_outdated_large_files_summary_fallback
 test_large_none
 test_large_split_lockfile
 test_large_only_lockfiles

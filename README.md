@@ -227,6 +227,26 @@ COMMITIA_CLAUDE_MODEL="sonnet"    # modelo (CURSOR, COPILOT, CLAUDE, CODEX, GEMI
 
 > O provedor `gemini` usa a API REST; `gemini-cli` usa a CLI `gemini`.
 
+#### Versões e capacidades exigidas das CLIs
+
+Antes de gerar a mensagem, o commitia valida a CLI **por capacidade**: o `--help` precisa listar as flags abaixo. Não há versão mínima fixa (não dá para determiná-la com segurança); a versão instalada é mostrada apenas para diagnóstico. Se faltar alguma flag, o commitia aborta e informa a CLI, a versão instalada, a capacidade ausente e o comando de atualização.
+
+| Provedor     | Flags exigidas no `--help`                                                                                                     | Atualizar                                                          | Versão testada |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ | -------------- |
+| `cursor`     | `--print` `--output-format` `--mode`                                                                                           | `cursor-agent update`                                              | 2026.01.23     |
+| `copilot`    | `--prompt` `--silent` `--no-color` `--no-ask-user` `--no-custom-instructions` `--no-auto-update` `--disable-builtin-mcps` `--deny-tool` | `npm install -g @github/copilot@latest` (ou `copilot update`)      | 1.0.116        |
+| `claude`     | `--print` `--tools` `--disable-slash-commands` `--strict-mcp-config` `--no-session-persistence` `--output-format`              | `npm install -g @anthropic-ai/claude-code@latest` (ou `claude update`) | 2.1.332    |
+| `codex`      | (em `codex exec --help`) `--skip-git-repo-check` `--ephemeral` `--sandbox` `--color` `--output-last-message`                  | `npm install -g @openai/codex@latest` (ou `codex update`)          | 0.172.0        |
+| `gemini-cli` | `--approval-mode` `--skip-trust` `--output-format` `--prompt`                                                                  | `npm install -g @google/gemini-cli@latest`                         | 0.71.1         |
+
+Se mesmo assim a CLI responder com `unknown option`, `unrecognized option` ou similar, o commitia mostra a mesma mensagem de atualização (o log em `.commitia/logs/` mantém a saída original) e não usa o fallback de arquivos grandes para esconder o problema.
+
+Para pular a validação preventiva (por exemplo, com uma CLI que oculta flags no `--help`):
+
+```bash
+COMMITIA_SKIP_CLI_VERSION_CHECK="true"
+```
+
 ## 📦 Arquivos grandes (lockfiles e diffs enormes)
 
 Lockfiles e arquivos com diff muito grande costumam estourar o limite da IA. O CommitIA os identifica no stage e os commita **separadamente**, sem você precisar fazer nada manualmente.

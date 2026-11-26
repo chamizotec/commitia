@@ -96,6 +96,10 @@
 # COMMITIA_CLI_TIMEOUT="120"
 # Limite de caracteres do diff enviado (padrão: 60000):
 # COMMITIA_MAX_DIFF_CHARS="60000"
+# Validação de versão: antes de gerar a mensagem, o commitia confere se o '--help' da CLI
+# lista as flags que ele usa e, se faltar alguma, pede para atualizar a CLI.
+# Para pular essa checagem (padrão: false):
+# COMMITIA_SKIP_CLI_VERSION_CHECK="true"
 # Modelo opcional por CLI (padrão: o da própria CLI):
 # COMMITIA_CURSOR_MODEL=""
 # COMMITIA_COPILOT_MODEL=""

@@ -320,6 +320,7 @@ print_help() {
   echo "    - COMMITIA_PROVIDER: amp, openai, gemini, ollama, cursor, copilot, claude, codex, gemini-cli (padrão: amp)"
   echo "    - COMMITIA_CLI_TIMEOUT: tempo máximo em segundos das CLIs de IA (padrão: 120)"
   echo "    - COMMITIA_<CLI>_MODEL: modelo opcional (CURSOR, COPILOT, CLAUDE, CODEX, GEMINI_CLI)"
+  echo "    - COMMITIA_SKIP_CLI_VERSION_CHECK: true pula a validação de versão das CLIs (padrão: false)"
   echo "    - COMMITIA_LANGUAGE: pt, en, es (padrão: pt)"
   echo "    - COMMITIA_AUTO_STAGE: true, false (padrão: true)"
   echo "    - COMMITIA_LARGE_FILES: true, false - trata arquivos grandes em commits separados (padrão: true)"
@@ -360,6 +361,158 @@ info() {
 # ============================================================================
 # Validações
 # ============================================================================
+
+# ----------------------------------------------------------------------------
+# Validação de versão das CLIs de IA (cursor, copilot, claude, codex, gemini-cli)
+#
+# A verificação é por CAPACIDADE: o '--help' da CLI precisa listar as flags que o
+# commitia usa. Não há versão mínima fixa, pois não dá para determiná-la com
+# segurança para todas as CLIs (a versão instalada é mostrada só para diagnóstico).
+# ----------------------------------------------------------------------------
+
+# Cache da execução atual (o provedor é único por execução)
+CLI_HELP_LOADED=false
+CLI_HELP_CACHE=""
+CLI_VERSION_CACHE=""
+CLI_MISSING_FLAGS=""
+
+# Define os dados da CLI do provedor atual (CLI_BIN, CLI_HELP_ARGS,
+# CLI_REQUIRED_FLAGS, CLI_UPDATE_CMD). Retorna 1 se o provedor não usa CLI.
+load_cli_spec() {
+  case "$AI_PROVIDER" in
+    cursor)
+      CLI_BIN="cursor-agent"
+      CLI_HELP_ARGS="--help"
+      CLI_REQUIRED_FLAGS="--print --output-format --mode"
+      CLI_UPDATE_CMD="cursor-agent update"
+      ;;
+    copilot)
+      CLI_BIN="copilot"
+      CLI_HELP_ARGS="--help"
+      CLI_REQUIRED_FLAGS="--prompt --silent --no-color --no-ask-user --no-custom-instructions --no-auto-update --disable-builtin-mcps --deny-tool"
+      CLI_UPDATE_CMD="npm install -g @github/copilot@latest  (ou: copilot update)"
+      ;;
+    claude)
+      CLI_BIN="claude"
+      CLI_HELP_ARGS="--help"
+      CLI_REQUIRED_FLAGS="--print --tools --disable-slash-commands --strict-mcp-config --no-session-persistence --output-format"
+      CLI_UPDATE_CMD="npm install -g @anthropic-ai/claude-code@latest  (ou: claude update)"
+      ;;
+    codex)
+      CLI_BIN="codex"
+      CLI_HELP_ARGS="exec --help"
+      CLI_REQUIRED_FLAGS="--skip-git-repo-check --ephemeral --sandbox --color --output-last-message"
+      CLI_UPDATE_CMD="npm install -g @openai/codex@latest  (ou: codex update)"
+      ;;
+    gemini-cli)
+      CLI_BIN="gemini"
+      CLI_HELP_ARGS="--help"
+      CLI_REQUIRED_FLAGS="--approval-mode --skip-trust --output-format --prompt"
+      CLI_UPDATE_CMD="npm install -g @google/gemini-cli@latest"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+# Executa um comando rápido (--help/--version) com timeout curto, se disponível
+run_quick() {
+  if command -v timeout &>/dev/null; then
+    timeout 15 "$@"
+  elif command -v gtimeout &>/dev/null; then
+    gtimeout 15 "$@"
+  else
+    "$@"
+  fi
+}
+
+# Lê o '--help' da CLI uma única vez por execução (cache em CLI_HELP_CACHE)
+get_cli_help() {
+  [ "$CLI_HELP_LOADED" = true ] && return 0
+  CLI_HELP_LOADED=true
+  # shellcheck disable=SC2086
+  CLI_HELP_CACHE=$(run_quick "$CLI_BIN" $CLI_HELP_ARGS 2>&1 </dev/null || true)
+}
+
+# Lê a versão instalada (só para diagnóstico); cache em CLI_VERSION_CACHE
+get_cli_version() {
+  [ -n "$CLI_VERSION_CACHE" ] && return 0
+  local v
+  v=$(run_quick "$CLI_BIN" --version 2>&1 </dev/null | head -1 | \
+    grep -oE '[0-9]+(\.[0-9]+)+[0-9A-Za-z._-]*' | head -1 || true)
+  v="${v%%[.-]}"
+  CLI_VERSION_CACHE="${v:-desconhecida}"
+}
+
+# Preenche CLI_MISSING_FLAGS com as flags exigidas que o '--help' não lista.
+# Se o '--help' não puder ser lido, não bloqueia (não dá para afirmar nada).
+find_missing_cli_flags() {
+  CLI_MISSING_FLAGS=""
+  get_cli_help
+  [ -z "$CLI_HELP_CACHE" ] && return 0
+
+  local flag
+  for flag in $CLI_REQUIRED_FLAGS; do
+    if ! printf '%s\n' "$CLI_HELP_CACHE" | grep -Eq -- "(^|[^[:alnum:]-])${flag}([^[:alnum:]-]|$)"; then
+      CLI_MISSING_FLAGS="${CLI_MISSING_FLAGS:+$CLI_MISSING_FLAGS }$flag"
+    fi
+  done
+}
+
+# A saída bruta indica flag/opção não reconhecida (CLI desatualizada)?
+is_cli_outdated_output() {
+  printf '%s\n' "$1" | grep -Eiq \
+    "(unknown|unrecognized|unrecognised|invalid|unsupported|unexpected) (option|flag|argument|arguments|subcommand|command)|no such option|did you mean --|unexpected argument"
+}
+
+# Exibe a mensagem "CLI precisa ser atualizada" (em stderr).
+# $1: flags ausentes detectadas pelo --help (pode ser vazio)
+# $2: saída bruta da CLI (opcional; usada para extrair a flag reclamada)
+print_cli_outdated() {
+  local missing="$1" raw="$2"
+  local what="$missing"
+
+  if [ -z "$what" ] && [ -n "$raw" ]; then
+    what=$(printf '%s\n' "$raw" | grep -oE -e '--[a-z][a-z0-9-]*' | head -1 || true)
+  fi
+  get_cli_version
+
+  echo "" >&2
+  echo -e "${RED}✗ Erro: a CLI '$CLI_BIN' precisa ser atualizada${NC}" >&2
+  echo -e "  Versão instalada:  ${BOLD}${CLI_VERSION_CACHE}${NC}" >&2
+  echo -e "  Não suportado:     ${BOLD}${what:-flags exigidas pelo commitia}${NC}" >&2
+  echo -e "  Atualize com:      ${BOLD}${CLI_UPDATE_CMD}${NC}" >&2
+  echo -e "  Ou use outro provedor: ${BOLD}$SCRIPT_NAME --provider <provedor>${NC}" >&2
+}
+
+# Validação preventiva: aborta antes de gerar a mensagem se a CLI estiver desatualizada
+check_cli_version() {
+  [ "$SKIP_CLI_VERSION_CHECK" = true ] && return 0
+  load_cli_spec || return 0
+
+  find_missing_cli_flags
+  if [ -n "$CLI_MISSING_FLAGS" ]; then
+    print_cli_outdated "$CLI_MISSING_FLAGS" ""
+    echo -e "  Para pular esta checagem: COMMITIA_SKIP_CLI_VERSION_CHECK=true" >&2
+    exit 1
+  fi
+}
+
+# Rede de segurança em tempo de execução: se a falha da IA foi por flag
+# desconhecida, mostra a mensagem de atualização (o log já foi gravado).
+# Retorna 0 se tratou o erro como CLI desatualizada.
+report_cli_outdated_failure() {
+  load_cli_spec || return 1
+  is_cli_outdated_output "$COMMITIA_RAW_OUTPUT" || return 1
+
+  find_missing_cli_flags
+  print_cli_outdated "$CLI_MISSING_FLAGS" "$COMMITIA_RAW_OUTPUT"
+  echo -e "  Log gravado em:    ${BOLD}$LOG_PATH${NC}" >&2
+  echo -e "  Se a CLI já estiver atualizada, consulte o log para ver o erro original." >&2
+  return 0
+}
 
 check_dependencies() {
   # Verifica se está em um repositório git
@@ -433,6 +586,9 @@ check_dependencies() {
       error "Provedor de IA desconhecido: $AI_PROVIDER"
       ;;
   esac
+
+  # Provedores baseados em CLI: valida se a versão instalada suporta as flags usadas
+  check_cli_version
 }
 
 check_staged_changes() {
@@ -567,6 +723,7 @@ load_config() {
   AI_PROVIDER="${CLI_PROVIDER:-${COMMITIA_PROVIDER:-amp}}"
   LANGUAGE="${CLI_LANGUAGE:-${COMMITIA_LANGUAGE:-pt}}"
   AUTO_STAGE="${CLI_AUTO_STAGE:-${COMMITIA_AUTO_STAGE:-true}}"
+  SKIP_CLI_VERSION_CHECK="${COMMITIA_SKIP_CLI_VERSION_CHECK:-false}"
 
   # Arquivos grandes (lockfiles e diffs muito grandes)
   LARGE_FILES_ENABLED="${COMMITIA_LARGE_FILES:-true}"
@@ -1438,6 +1595,10 @@ commit_staged_group() {
 
     if [ -z "$COMMIT_MSG" ]; then
       log_ai_failure "$prompt" "$(get_staged_diff)"
+      # CLI desatualizada (flag desconhecida): avisa e aborta, sem usar fallback
+      if report_cli_outdated_failure; then
+        return 1
+      fi
       if [ "$allow_fallback" != true ]; then
         echo ""
         echo -e "${RED}✗ Erro: Não foi possível gerar a mensagem de commit${NC}" >&2
@@ -1469,6 +1630,11 @@ commit_staged_group() {
       MSG_SOURCE="resumo"
     else
       log_ai_failure "$prompt" "$COMMITIA_SUMMARY"
+      # CLI desatualizada: avisa e aborta em vez de cair no último recurso
+      if report_cli_outdated_failure; then
+        DIFF_MODE="full"
+        return 1
+      fi
       warn "A IA também falhou com o resumo (log: $LOG_PATH)"
       # Fallback 2 (último recurso): mensagem determinística
       COMMIT_MSG=$(fallback_commit_message)
