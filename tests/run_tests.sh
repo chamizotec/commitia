@@ -31,6 +31,15 @@ skip() {
   echo -e "${YELLOW}- SKIP:${NC} $1"
 }
 
+# Hash de stdin (shasum no macOS/Linux; sha1sum no Git Bash/Windows)
+hash_stdin() {
+  if command -v shasum &>/dev/null; then
+    shasum
+  else
+    sha1sum
+  fi
+}
+
 # ----------------------------------------------------------------------------
 # Testes
 # ----------------------------------------------------------------------------
@@ -468,10 +477,10 @@ test_large_dry_run() {
   lg_git add -A
   local head_before staged_before
   head_before=$(lg_git rev-parse HEAD)
-  staged_before=$(lg_git diff --staged | shasum)
+  staged_before=$(lg_git diff --staged | hash_stdin)
   lg_commitia FAKE_FAIL_MATCH='^Diff:' FAKE_FAIL_MATCH2='pnpm-lock' --dry-run
   expect_eq "Dry-run: nenhum commit criado" "$(lg_git rev-parse HEAD)" "$head_before"
-  expect_eq "Dry-run: stage intacto" "$(lg_git diff --staged | shasum)" "$staged_before"
+  expect_eq "Dry-run: stage intacto" "$(lg_git diff --staged | hash_stdin)" "$staged_before"
   expect_eq "Dry-run: ambos continuam no stage" "$(lg_staged)" "app.sh pnpm-lock.yaml"
   expect_contains "Dry-run: mostra o plano" "$LG_OUT" "Arquivos grandes detectados"
   expect_contains "Dry-run: mostra que usou fallback" "$LG_OUT" "Mensagem gerada pelo fallback"
@@ -653,6 +662,180 @@ EOF2
 }
 
 # ----------------------------------------------------------------------------
+# --config (configuração pela linha de comando)
+# ----------------------------------------------------------------------------
+
+setup_config_env() {
+  CF_DIR=$(mktemp -d)
+  CF_HOME="$CF_DIR/home"
+  CF_REPO="$CF_DIR/repo"
+  mkdir -p "$CF_HOME" "$CF_REPO" "$CF_DIR/bin" "$CF_DIR/plain"
+  git -C "$CF_REPO" init -q
+}
+
+teardown_config_env() {
+  rm -rf "$CF_DIR"
+}
+
+# Executa "commitia --config ..." com HOME isolado, dentro do repo temporário
+# (ou em $CF_WORKDIR). Saída sem ANSI em $CF_OUT e código de saída em $CF_RC.
+cfg() {
+  local out
+  out=$( (cd "${CF_WORKDIR:-$CF_REPO}" && env -u COMMITIA_PROVIDER -u COMMITIA_LANGUAGE -u COMMITIA_AUTO_STAGE \
+    -u COMMITIA_LARGE_FILES -u COMMITIA_CLAUDE_MODEL -u COMMITIA_CLI_TIMEOUT \
+    HOME="$CF_HOME" "$COMMITIA" --config "$@" 2>&1; echo "RC=$?") | perl -pe 's/\e\[[0-9;]*m//g')
+  CF_RC=$(echo "$out" | sed -n 's/^RC=//p')
+  CF_OUT=$(echo "$out" | sed '/^RC=[0-9]*$/d')
+}
+
+cf_global() { cat "$CF_HOME/.commitiarc" 2>/dev/null | tr -d '\r'; }
+cf_count() { grep -c "^$1=" "$CF_HOME/.commitiarc" 2>/dev/null || true; }
+
+test_config() {
+  setup_config_env
+
+  # Definir e ler (global é o padrão)
+  cfg provider copilot
+  expect_eq "Config: define provider (rc)" "$CF_RC" "0"
+  expect_contains "Config: define provider (mensagem)" "$CF_OUT" "provider = copilot"
+  expect_contains "Config: grava no arquivo global" "$(cf_global)" 'COMMITIA_PROVIDER="copilot"'
+  cfg provider
+  expect_eq "Config: lê provider" "$CF_OUT" "copilot"
+  cfg PROVIDER
+  expect_eq "Config: chave em maiúsculas" "$CF_OUT" "copilot"
+  cfg COMMITIA_PROVIDER
+  expect_eq "Config: chave com prefixo COMMITIA_" "$CF_OUT" "copilot"
+
+  # Substitui sem duplicar e preserva o restante do arquivo
+  printf '# meu comentario\nCOMMITIA_LANGUAGE="en"\nCOMMITIA_PROVIDER="copilot"\nOUTRA="x"\n' > "$CF_HOME/.commitiarc"
+  cfg provider claude
+  expect_eq "Config: substitui sem duplicar" "$(cf_count COMMITIA_PROVIDER)" "1"
+  expect_contains "Config: novo valor gravado" "$(cf_global)" 'COMMITIA_PROVIDER="claude"'
+  expect_contains "Config: preserva comentário" "$(cf_global)" "# meu comentario"
+  expect_contains "Config: preserva outras variáveis" "$(cf_global)" 'OUTRA="x"'
+  expect_contains "Config: preserva idioma" "$(cf_global)" 'COMMITIA_LANGUAGE="en"'
+
+  # Apelidos e caixa
+  cfg lang PT
+  expect_eq "Config: lang/PT normaliza" "$(cf_global | grep '^COMMITIA_LANGUAGE=')" 'COMMITIA_LANGUAGE="pt"'
+  cfg provider COPILOT
+  cfg provider
+  expect_eq "Config: provedor aceita qualquer caixa" "$CF_OUT" "copilot"
+
+  # Validação: erro, código 1 e nada alterado
+  cfg provider inexistente
+  expect_eq "Config: provedor inválido (rc)" "$CF_RC" "1"
+  expect_contains "Config: provedor inválido (mensagem)" "$CF_OUT" "provedor inválido"
+  cfg provider
+  expect_eq "Config: provedor inválido não altera" "$CF_OUT" "copilot"
+  cfg language fr
+  expect_eq "Config: idioma inválido" "$CF_RC" "1"
+  cfg auto-stage talvez
+  expect_eq "Config: booleano inválido" "$CF_RC" "1"
+  cfg large-file-lines abc
+  expect_eq "Config: número inválido" "$CF_RC" "1"
+  cfg chave-inexistente x
+  expect_eq "Config: chave desconhecida (rc)" "$CF_RC" "1"
+  expect_contains "Config: chave desconhecida (mensagem)" "$CF_OUT" "Chave desconhecida"
+  cfg provider a b
+  expect_eq "Config: argumentos demais" "$CF_RC" "1"
+
+  # Padrão e listagem
+  cfg large-file-lines
+  expect_eq "Config: valor padrão" "$CF_OUT" "1000"
+  cfg
+  expect_eq "Config: listagem (rc)" "$CF_RC" "0"
+  expect_contains "Config: listagem mostra provider" "$CF_OUT" "provider"
+  expect_contains "Config: listagem mostra origem global" "$CF_OUT" "global"
+  expect_contains "Config: listagem mostra origem padrão" "$CF_OUT" "padrão"
+
+  # Projeto (--local) tem prioridade sobre o global
+  cfg --local provider claude
+  expect_eq "Config: --local (rc)" "$CF_RC" "0"
+  expect_contains "Config: --local grava no repo" "$(cat "$CF_REPO/.commitiarc")" 'COMMITIA_PROVIDER="claude"'
+  cfg provider
+  expect_eq "Config: projeto vence o global" "$CF_OUT" "claude"
+  cfg --global provider
+  expect_eq "Config: --global lê só o global" "$CF_OUT" "copilot"
+  cfg --local --list
+  expect_contains "Config: --local --list" "$CF_OUT" "claude"
+  cfg --local --unset provider
+  cfg provider
+  expect_eq "Config: --unset local volta ao global" "$CF_OUT" "copilot"
+
+  # --unset global
+  cfg --unset provider
+  expect_eq "Config: --unset global (rc)" "$CF_RC" "0"
+  expect_eq "Config: --unset remove a linha" "$(cf_count COMMITIA_PROVIDER)" "0"
+  cfg provider
+  expect_eq "Config: --unset volta ao padrão" "$CF_OUT" "amp"
+  expect_contains "Config: --unset preserva o resto" "$(cf_global)" 'OUTRA="x"'
+  cfg --unset provider
+  expect_contains "Config: --unset de chave ausente" "$CF_OUT" "nada a remover"
+
+  # Valores com espaço e caracteres especiais
+  cfg large-file-patterns "pnpm-lock.yaml yarn.lock"
+  cfg large-file-patterns
+  expect_eq "Config: valor com espaço" "$CF_OUT" "pnpm-lock.yaml yarn.lock"
+  cfg large-file-patterns "it's \$x \"q\" \`b\` \\z"
+  cfg large-file-patterns
+  expect_eq "Config: aspas, \$, crase e barra" "$CF_OUT" "it's \$x \"q\" \`b\` \\z"
+
+  # Arquivo salvo com CRLF (Bloco de Notas no Windows)
+  printf 'COMMITIA_PROVIDER="ollama"\r\nCOMMITIA_LANGUAGE="en"\r\n' > "$CF_HOME/.commitiarc"
+  cfg provider
+  expect_eq "Config: lê arquivo com CRLF" "$CF_OUT" "ollama"
+  cfg provider codex
+  expect_eq "Config: reescreve arquivo com CRLF" "$(cf_count COMMITIA_PROVIDER)" "1"
+  cfg provider
+  expect_eq "Config: valor após reescrever CRLF" "$CF_OUT" "codex"
+
+  # Variável de ambiente (menor prioridade que os arquivos)
+  rm -f "$CF_HOME/.commitiarc"
+  CF_OUT=$( (cd "$CF_REPO" && HOME="$CF_HOME" COMMITIA_CLAUDE_MODEL=sonnet "$COMMITIA" --config claude-model 2>&1))
+  expect_eq "Config: lê variável de ambiente" "$CF_OUT" "sonnet"
+
+  # --local fora de um repositório Git
+  CF_WORKDIR="$CF_DIR/plain" cfg --local provider claude
+  expect_eq "Config: --local fora do git" "$CF_RC" "1"
+  CF_WORKDIR="$CF_DIR/plain" cfg provider copilot
+  expect_eq "Config: global funciona fora do git" "$CF_RC" "0"
+
+  # Flags de config sem --config
+  if (cd "$CF_REPO" && HOME="$CF_HOME" "$COMMITIA" --local 2>&1 | grep -q "só podem ser usados com --config"); then
+    pass "Config: --local sem --config é rejeitado"
+  else
+    fail "Config: --local sem --config não é rejeitado"
+  fi
+
+  teardown_config_env
+}
+
+# A execução normal usa o provedor gravado por --config (sem --provider)
+test_config_is_used() {
+  large_tests_available || return 0
+  setup_config_env
+  cat > "$CF_DIR/bin/claude" << 'EOF2'
+#!/usr/bin/env bash
+cat > /dev/null
+echo "feat(app): adiciona recurso"
+EOF2
+  chmod +x "$CF_DIR/bin/claude"
+
+  cfg provider claude
+  echo 'echo a' > "$CF_REPO/app.sh"
+  local out
+  out=$( (cd "$CF_REPO" && env -u COMMITIA_PROVIDER HOME="$CF_HOME" PATH="$CF_DIR/bin:$PATH" "$COMMITIA" -d 2>&1) | perl -pe 's/\e\[[0-9;]*m//g')
+  expect_contains "Config usada: provedor gravado" "$out" "Gerando mensagem com IA (claude)"
+  expect_contains "Config usada: mensagem gerada" "$out" "feat(app): adiciona recurso"
+
+  # --provider na linha de comando continua tendo prioridade
+  out=$( (cd "$CF_REPO" && env -u COMMITIA_PROVIDER HOME="$CF_HOME" PATH="$CF_DIR/bin:$PATH" "$COMMITIA" -d --provider ollama 2>&1) | perl -pe 's/\e\[[0-9;]*m//g' || true)
+  expect_not_contains "Config usada: --provider vence o arquivo" "$out" "Gerando mensagem com IA (claude)"
+  teardown_config_env
+}
+
+# ----------------------------------------------------------------------------
 # Execução
 # ----------------------------------------------------------------------------
 
@@ -689,6 +872,8 @@ test_large_files_argument
 test_large_interactive
 test_large_special_names_and_deletion
 test_large_unborn_repo
+test_config
+test_config_is_used
 
 echo ""
 echo "====================================="

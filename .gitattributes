@@ -1,0 +1,8 @@
+# Scripts bash e arquivos de configuração lidos pelo bash precisam de LF
+# mesmo no Windows (core.autocrlf=true converteria tudo para CRLF).
+*.sh text eol=lf
+bin/commitia text eol=lf
+.commitiarc text eol=lf
+.commitiarc.example text eol=lf
+# O atalho do cmd precisa de CRLF
+installer/commitia.cmd text eol=crlf

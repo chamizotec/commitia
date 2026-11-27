@@ -22,6 +22,9 @@ Thumbs.db
 .test/
 test_output/
 
+# Saída do build do instalador Windows
+dist/
+
 # Configuração local (não commitar configurações pessoais)
 .commitiarc
 
