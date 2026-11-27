@@ -836,6 +836,91 @@ EOF2
 }
 
 # ----------------------------------------------------------------------------
+# Prompt como argumento (copilot/cursor): limite de tamanho (Windows: ~32 mil)
+# ----------------------------------------------------------------------------
+
+test_cli_argv_limit() {
+  large_tests_available || return 0
+  setup_config_env
+  # Copilot falso: grava o tamanho do último argumento (o prompt) e responde
+  cat > "$CF_DIR/bin/copilot" << 'EOF2'
+#!/usr/bin/env bash
+last=""
+for a in "$@"; do last="$a"; done
+printf '%s' "${#last}" > "$FAKE_LEN_FILE"
+echo "feat(app): adiciona recurso"
+EOF2
+  chmod +x "$CF_DIR/bin/copilot"
+  git -C "$CF_REPO" config user.email t@t.t
+  git -C "$CF_REPO" config user.name teste
+  # Diff bem maior que o limite
+  for i in $(seq 1 3000); do echo "linha de teste número $i com algum texto"; done > "$CF_REPO/grande.txt"
+  git -C "$CF_REPO" add -A
+
+  local len out
+  FAKE_LEN_FILE="$CF_DIR/len.txt"
+  out=$( (cd "$CF_REPO" && HOME="$CF_HOME" PATH="$CF_DIR/bin:$PATH" FAKE_LEN_FILE="$FAKE_LEN_FILE" \
+    COMMITIA_ARG_MAX_CHARS=5000 "$COMMITIA" -d --provider copilot 2>&1) | perl -pe 's/\e\[[0-9;]*m//g')
+  len=$(cat "$FAKE_LEN_FILE" 2>/dev/null || echo 0)
+  expect_contains "Argv: mensagem gerada com diff grande" "$out" "feat(app): adiciona recurso"
+  if [ "$len" -le 5000 ] && [ "$len" -gt 0 ]; then
+    pass "Argv: prompt respeita o limite ($len <= 5000)"
+  else
+    fail "Argv: prompt maior que o limite ($len > 5000)"
+  fi
+
+  # Sem limite (0): o diff inteiro (até COMMITIA_MAX_DIFF_CHARS) segue como argumento
+  out=$( (cd "$CF_REPO" && HOME="$CF_HOME" PATH="$CF_DIR/bin:$PATH" FAKE_LEN_FILE="$FAKE_LEN_FILE" \
+    COMMITIA_ARG_MAX_CHARS=0 "$COMMITIA" -d --provider copilot 2>&1) | perl -pe 's/\e\[[0-9;]*m//g')
+  len=$(cat "$FAKE_LEN_FILE" 2>/dev/null || echo 0)
+  if [ "$len" -gt 5000 ]; then
+    pass "Argv: sem limite envia o diff completo ($len caracteres)"
+  else
+    fail "Argv: sem limite deveria enviar mais que 5000 ($len)"
+  fi
+  teardown_config_env
+}
+
+# ----------------------------------------------------------------------------
+# Erros visíveis no terminal (não só no log)
+# ----------------------------------------------------------------------------
+
+test_errors_on_terminal() {
+  large_tests_available || return 0
+  setup_config_env
+  git -C "$CF_REPO" config user.email t@t.t
+  git -C "$CF_REPO" config user.name teste
+
+  # Falha de commit: hook rejeita a mensagem com uma explicação
+  cat > "$CF_DIR/bin/copilot" << 'EOF2'
+#!/usr/bin/env bash
+echo "feat(app): adiciona recurso"
+EOF2
+  chmod +x "$CF_DIR/bin/copilot"
+  printf '#!/bin/sh\necho "REJEITADO-TESTE: mensagem fora do padrão" >&2\nexit 1\n' > "$CF_REPO/.git/hooks/commit-msg"
+  chmod +x "$CF_REPO/.git/hooks/commit-msg"
+  echo 'echo a' > "$CF_REPO/app.sh"
+  local out
+  out=$( (cd "$CF_REPO" && HOME="$CF_HOME" PATH="$CF_DIR/bin:$PATH" "$COMMITIA" --provider copilot 2>&1) | perl -pe 's/\e\[[0-9;]*m//g' || true)
+  expect_contains "Erro no terminal: falha de commit aparece" "$out" "Falha ao realizar commit"
+  expect_contains "Erro no terminal: saída do hook aparece" "$out" "REJEITADO-TESTE"
+  rm -f "$CF_REPO/.git/hooks/commit-msg"
+
+  # Falha da IA: a CLI diz que não está autenticada
+  cat > "$CF_DIR/bin/copilot" << 'EOF2'
+#!/usr/bin/env bash
+echo "Error: No authentication information found."
+exit 1
+EOF2
+  chmod +x "$CF_DIR/bin/copilot"
+  git -C "$CF_REPO" reset -q
+  out=$( (cd "$CF_REPO" && HOME="$CF_HOME" PATH="$CF_DIR/bin:$PATH" "$COMMITIA" -d --provider copilot 2>&1) | perl -pe 's/\e\[[0-9;]*m//g' || true)
+  expect_contains "Erro no terminal: falha da IA aparece" "$out" "No authentication information found"
+  expect_contains "Erro no terminal: dica de login" "$out" "copilot login"
+  teardown_config_env
+}
+
+# ----------------------------------------------------------------------------
 # Execução
 # ----------------------------------------------------------------------------
 
@@ -874,6 +959,8 @@ test_large_special_names_and_deletion
 test_large_unborn_repo
 test_config
 test_config_is_used
+test_cli_argv_limit
+test_errors_on_terminal
 
 echo ""
 echo "====================================="
