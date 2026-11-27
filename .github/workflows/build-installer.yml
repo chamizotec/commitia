@@ -1,0 +1,94 @@
+# Gera o instalador Windows (commitia-setup.exe) com Inno Setup.
+# Roda manualmente (workflow_dispatch) ou ao publicar uma tag v*.
+# Tags são anexadas à release; execuções manuais ficam só como artefato.
+
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validar fins de linha dos scripts bash
+        shell: bash
+        run: |
+          for f in bin/commitia $(git ls-files '*.sh'); do
+            if grep -q $'\r' "$f"; then
+              echo "$f contém CRLF; o .gitattributes deveria forçar LF" >&2
+              exit 1
+            fi
+          done
+
+      - name: Rodar a suíte de testes no Windows (Git Bash)
+        shell: bash
+        run: ./tests/run_tests.sh
+
+      - name: Obter versão e validar tag
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(grep -m1 '^VERSION=' bin/commitia | cut -d'"' -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Versão: $VERSION"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "${GITHUB_REF_NAME#v}" != "$VERSION" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} não bate com VERSION=$VERSION em bin/commitia" >&2
+            exit 1
+          fi
+
+      - name: Instalar Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Compilar instalador
+        shell: pwsh
+        run: |
+          # Procura o ISCC.exe (o caminho muda com a versão: Inno Setup 6, 7...)
+          $iscc = Get-ChildItem "${env:ProgramFiles(x86)}", $env:ProgramFiles -Filter ISCC.exe -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $iscc) { throw "ISCC.exe não encontrado" }
+          & $iscc "/DAppVersion=${{ steps.version.outputs.version }}" installer\commitia.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC falhou com código $LASTEXITCODE" }
+
+      - name: Testar instalação silenciosa
+        shell: pwsh
+        run: |
+          $setup = Join-Path $PWD 'dist\commitia-setup.exe'
+          Start-Process -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+          $cmd = Join-Path $env:LOCALAPPDATA 'commitia\commitia.cmd'
+          if (-not (Test-Path $cmd)) { throw "commitia.cmd não foi instalado em $cmd" }
+          $out = & $cmd --version 2>&1 | Out-String
+          Write-Host $out
+          if ($out -notmatch 'CommitIA v') { throw "commitia --version não respondeu como esperado" }
+
+          # --config pelo atalho do Windows (inclui valor com espaço, para validar as aspas)
+          & $cmd --config provider copilot | Out-Null
+          $prov = (& $cmd --config provider 2>&1 | Out-String).Trim()
+          if ($prov -ne 'copilot') { throw "commitia --config provider devolveu '$prov' (esperado: copilot)" }
+          & $cmd --config large-file-patterns "pnpm-lock.yaml yarn.lock" | Out-Null
+          $pat = (& $cmd --config large-file-patterns 2>&1 | Out-String).Trim()
+          if ($pat -ne 'pnpm-lock.yaml yarn.lock') { throw "valor com espaço chegou como '$pat'" }
+
+      - name: Enviar artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: commitia-setup-${{ steps.version.outputs.version }}
+          path: dist/commitia-setup.exe
+
+      - name: Anexar à release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/commitia-setup.exe

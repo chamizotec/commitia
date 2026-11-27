@@ -9,7 +9,7 @@
 
 set -e
 
-VERSION="1.0.15"
+VERSION="1.0.18"
 SCRIPT_NAME="commitia"
 REPO_URL="https://github.com/chamizotec/commitia"
 # COMMITIA_REPO_RAW_URL permite apontar para outra origem (uso avançado e testes)
@@ -295,6 +295,8 @@ print_help() {
   echo "  --no-stage               Não adiciona arquivos ao stage automaticamente"
   echo "  --provider <provider>    Define o provedor de IA (amp, openai, gemini, ollama, cursor, copilot, claude, codex, gemini-cli)"
   echo "  --lang <idioma>          Idioma da mensagem (pt, en, es)"
+  echo "  --config [chave [valor]] Mostra ou define configurações (ex.: --config provider copilot)"
+  echo "                           Complementos: --global (padrão), --local (projeto), --unset, --list"
   echo "  --update                 Atualiza para a versão mais recente"
   echo "  --force                  Força atualização (usar com --update)"
   echo "  -v, --version            Mostra a versão"
@@ -307,6 +309,14 @@ print_help() {
   echo "  $SCRIPT_NAME -t fix -s auth         # Força tipo 'fix' com escopo 'auth'"
   echo "  $SCRIPT_NAME -i                     # Modo interativo"
   echo "  $SCRIPT_NAME -d                     # Dry-run (apenas mostra a mensagem)"
+  echo ""
+  echo -e "${BOLD}CONFIGURAR PELA LINHA DE COMANDO:${NC}"
+  echo "  $SCRIPT_NAME --config                          # Lista a configuração efetiva e a origem"
+  echo "  $SCRIPT_NAME --config provider                 # Mostra o valor de uma chave"
+  echo "  $SCRIPT_NAME --config provider copilot         # Define (global: ~/.commitiarc)"
+  echo "  $SCRIPT_NAME --config --local provider claude  # Define só para o projeto (.commitiarc)"
+  echo "  $SCRIPT_NAME --config --unset provider         # Remove a chave (volta ao padrão)"
+  echo "  Chaves: ${CONFIG_KEYS}"
   echo ""
   echo -e "${BOLD}TIPOS DE COMMIT:${NC}"
   echo "  feat      Nova funcionalidade"
@@ -407,6 +417,42 @@ ask_yes_no() {
   case "$response" in
     [Nn]*) return 1 ;;
     *) return 0 ;;
+  esac
+}
+
+# Mostra no terminal (stderr) as primeiras linhas úteis de uma saída de erro,
+# sem códigos ANSI e indentadas. $2 = máximo de linhas (padrão 12).
+show_error_excerpt() {
+  local text="$1" max="${2:-12}" clean total
+  clean=$(printf '%s\n' "$text" | perl -pe 's/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\r//g' | grep -v '^[[:space:]]*$' || true)
+  [ -n "$clean" ] || return 0
+  total=$(printf '%s\n' "$clean" | wc -l | tr -d ' ')
+  printf '%s\n' "$clean" | head -n "$max" | while IFS= read -r line; do
+    printf '    %s\n' "${line:0:200}" >&2
+  done
+  if [ "$total" -gt "$max" ]; then
+    echo "    ... (mais $((total - max)) linha(s) no log)" >&2
+  fi
+}
+
+# Dica de solução para erros comuns (não imprime nada se não reconhecer o erro)
+show_error_hint() {
+  local text="$1"
+  case "$text" in
+    *"Author identity unknown"*|*"unable to auto-detect email"*|*"Please tell me who you are"*)
+      echo -e "  ${CYAN}Dica:${NC} o Git não sabe quem é você. Configure uma vez:" >&2
+      echo '    git config --global user.name "Seu Nome"' >&2
+      echo '    git config --global user.email "voce@exemplo.com"' >&2
+      ;;
+    *"No authentication information found"*)
+      echo -e "  ${CYAN}Dica:${NC} a CLI do provedor não está logada. Rode o login dela (ex.: copilot login)." >&2
+      ;;
+    *"Incorrect API key"*|*"invalid_api_key"*|*"API key not valid"*)
+      echo -e "  ${CYAN}Dica:${NC} a chave de API do provedor está inválida ou ausente (OPENAI_API_KEY / GEMINI_API_KEY)." >&2
+      ;;
+    *"Argument list too long"*)
+      echo -e "  ${CYAN}Dica:${NC} o diff é grande demais para a linha de comando. Commite em partes menores ou ajuste COMMITIA_ARG_MAX_CHARS." >&2
+      ;;
   esac
 }
 
@@ -1054,8 +1100,7 @@ load_config() {
   
   # Carrega configuração global se existir
   if [ -f "$CONFIG_FILE" ]; then
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
+    source_config_file "$CONFIG_FILE"
   fi
   
   # Carrega configuração local do projeto (sobrescreve global)
@@ -1064,8 +1109,7 @@ load_config() {
   
   if [ -n "$project_config" ] && [ -f "$project_config" ]; then
     info "Usando configuração do projeto: $project_config"
-    # shellcheck source=/dev/null
-    source "$project_config"
+    source_config_file "$project_config"
   fi
   
   # Aplica valores padrão APÓS carregar os configs
@@ -1428,6 +1472,423 @@ stage_changes() {
   return 0
 }
 
+
+# Configuração pela linha de comando (--config)
+#
+# Lê e grava os mesmos arquivos .commitiarc usados por load_config:
+#   global:  ~/.commitiarc            (padrão; no Windows: %USERPROFILE%\.commitiarc)
+#   projeto: <raiz do repo>/.commitiarc  (--local)
+# Compatível com bash 3.2 (macOS), Linux e Git Bash (Windows).
+# ============================================================================
+
+CONFIG_KEYS="provider language auto-stage large-files large-file-lines large-file-bytes large-file-patterns cli-timeout max-diff-chars cursor-model copilot-model claude-model codex-model gemini-cli-model gemini-model"
+VALID_PROVIDERS="amp openai gemini ollama cursor copilot claude codex gemini-cli"
+
+# Carrega um arquivo de configuração (bash). Remove CR antes, para aceitar
+# arquivos salvos com CRLF (ex.: Bloco de Notas no Windows).
+source_config_file() {
+  local file="$1" tmp rc=0
+  tmp=$(mktemp) || return 1
+  tr -d '\r' < "$file" > "$tmp"
+  # shellcheck source=/dev/null
+  source "$tmp" || rc=$?
+  rm -f "$tmp"
+  return $rc
+}
+
+# Normaliza o nome da chave: minúsculas, "_" -> "-", sem prefixo COMMITIA_
+# (aceita provider, PROVIDER e COMMITIA_PROVIDER; "lang" = "language").
+config_normalize_key() {
+  local k
+  k=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+  k="${k#commitia-}"
+  [ "$k" = "lang" ] && k="language"
+  printf '%s' "$k"
+}
+
+# Variável de configuração correspondente a uma chave (vazio se desconhecida)
+config_var_for_key() {
+  case "$1" in
+    provider)            echo "COMMITIA_PROVIDER" ;;
+    language)            echo "COMMITIA_LANGUAGE" ;;
+    auto-stage)          echo "COMMITIA_AUTO_STAGE" ;;
+    large-files)         echo "COMMITIA_LARGE_FILES" ;;
+    large-file-lines)    echo "COMMITIA_LARGE_FILE_LINES" ;;
+    large-file-bytes)    echo "COMMITIA_LARGE_FILE_BYTES" ;;
+    large-file-patterns) echo "COMMITIA_LARGE_FILE_PATTERNS" ;;
+    cli-timeout)         echo "COMMITIA_CLI_TIMEOUT" ;;
+    max-diff-chars)      echo "COMMITIA_MAX_DIFF_CHARS" ;;
+    cursor-model)        echo "COMMITIA_CURSOR_MODEL" ;;
+    copilot-model)       echo "COMMITIA_COPILOT_MODEL" ;;
+    claude-model)        echo "COMMITIA_CLAUDE_MODEL" ;;
+    codex-model)         echo "COMMITIA_CODEX_MODEL" ;;
+    gemini-cli-model)    echo "COMMITIA_GEMINI_CLI_MODEL" ;;
+    gemini-model)        echo "COMMITIA_GEMINI_MODEL" ;;
+    *) echo "" ;;
+  esac
+}
+
+# Valor padrão de uma chave (vazio quando não há padrão)
+config_default() {
+  case "$1" in
+    provider)            echo "amp" ;;
+    language)            echo "pt" ;;
+    auto-stage)          echo "true" ;;
+    large-files)         echo "true" ;;
+    large-file-lines)    echo "1000" ;;
+    large-file-bytes)    echo "100000" ;;
+    large-file-patterns) echo "$DEFAULT_LOCKFILE_PATTERNS" ;;
+    cli-timeout)         echo "120" ;;
+    max-diff-chars)      echo "60000" ;;
+    gemini-model)        echo "gemini-2.0-flash" ;;
+    *) echo "" ;;
+  esac
+}
+
+# Valida o valor de uma chave. Em caso de erro imprime o motivo e retorna 1.
+config_validate() {
+  local key="$1" value="$2" p
+
+  case "$value" in
+    *$'\n'*|*$'\r'*)
+      echo "o valor não pode conter quebra de linha"
+      return 1
+      ;;
+  esac
+
+  case "$key" in
+    provider)
+      for p in $VALID_PROVIDERS; do
+        [ "$p" = "$value" ] && return 0
+      done
+      echo "provedor inválido '$value' (use: ${VALID_PROVIDERS})"
+      return 1
+      ;;
+    language)
+      case "$value" in
+        pt|en|es) ;;
+        *) echo "idioma inválido '$value' (use: pt, en ou es)"; return 1 ;;
+      esac
+      ;;
+    auto-stage|large-files)
+      case "$value" in
+        true|false) ;;
+        *) echo "valor inválido '$value' (use: true ou false)"; return 1 ;;
+      esac
+      ;;
+    large-file-lines|large-file-bytes|cli-timeout|max-diff-chars)
+      case "$value" in
+        ''|*[!0-9]*) echo "valor inválido '$value' (use um número inteiro não negativo)"; return 1 ;;
+      esac
+      ;;
+  esac
+  return 0
+}
+
+# Escreve o valor de forma segura para ser lido por "source": aspas duplas para
+# valores simples; aspas simples quando há \ " $ ` ou ' no valor.
+config_quote_value() {
+  local v="$1"
+  case "$v" in
+    *\\*|*\"*|*\$*|*\`*|*\'*)
+      v=$(printf '%s' "$v" | sed "s/'/'\\\\''/g")
+      printf "'%s'" "$v"
+      ;;
+    *)
+      printf '"%s"' "$v"
+      ;;
+  esac
+}
+
+# Define CONFIG_TARGET_FILE conforme o escopo (global ou local)
+config_resolve_target() {
+  local scope="$1" root=""
+  if [ "$scope" = "local" ]; then
+    root=$(git rev-parse --show-toplevel 2>/dev/null) || root=""
+    [ -n "$root" ] || error "--local exige estar dentro de um repositório Git"
+    CONFIG_TARGET_FILE="$root/.commitiarc"
+  else
+    CONFIG_TARGET_FILE="$CONFIG_FILE"
+  fi
+}
+
+# Lê o valor de uma variável em um arquivo de configuração.
+# Imprime o valor e retorna 0 se estiver definida; retorna 1 caso contrário.
+config_file_get() {
+  local file="$1" var="$2" tmp out
+  [ -f "$file" ] || return 1
+  tmp=$(mktemp) || return 1
+  tr -d '\r' < "$file" > "$tmp"
+  out=$(
+    unset "$var"
+    # shellcheck source=/dev/null
+    source "$tmp" >/dev/null 2>&1 || true
+    if [ -n "${!var+x}" ]; then printf 'S%s' "${!var}"; fi
+  )
+  rm -f "$tmp"
+  [ -n "$out" ] || return 1
+  printf '%s' "${out#S}"
+}
+
+# Valor efetivo de uma chave e sua origem (projeto > global > ambiente > padrão),
+# na mesma ordem de prioridade de load_config. Define CONFIG_VALUE e CONFIG_SOURCE.
+config_effective() {
+  local key="$1" var="$2" v project_file=""
+  CONFIG_VALUE=""
+  CONFIG_SOURCE="padrão"
+
+  project_file=$(get_project_config_file) || project_file=""
+  if [ -n "$project_file" ] && v=$(config_file_get "$project_file" "$var"); then
+    CONFIG_VALUE="$v"
+    CONFIG_SOURCE="projeto"
+    return 0
+  fi
+  if v=$(config_file_get "$CONFIG_FILE" "$var"); then
+    CONFIG_VALUE="$v"
+    CONFIG_SOURCE="global"
+    return 0
+  fi
+  # cli-timeout e max-diff-chars já recebem o valor padrão no topo do script,
+  # então só contam como "ambiente" quando diferem do padrão
+  if [ -n "${!var+x}" ]; then
+    case "$key" in
+      cli-timeout|max-diff-chars)
+        [ "${!var}" = "$(config_default "$key")" ] && { CONFIG_VALUE="${!var}"; return 0; }
+        ;;
+    esac
+    CONFIG_VALUE="${!var}"
+    CONFIG_SOURCE="ambiente"
+    return 0
+  fi
+  CONFIG_VALUE=$(config_default "$key")
+  return 0
+}
+
+# Grava (ou substitui) VAR=valor preservando o restante do arquivo
+config_write_value() {
+  local file="$1" var="$2" quoted="$3" tmp
+  tmp=$(mktemp) || error "Não foi possível criar um arquivo temporário"
+
+  if [ -f "$file" ]; then
+    CI_NEW_LINE="${var}=${quoted}" awk -v key="$var" '
+      BEGIN {
+        line = ENVIRON["CI_NEW_LINE"]
+        pat = "^[[:space:]]*(export[[:space:]]+)?" key "="
+        done = 0
+      }
+      { sub(/\r$/, "") }
+      $0 ~ pat { if (!done) { print line; done = 1 } next }
+      { print }
+      END { if (!done) print line }
+    ' "$file" > "$tmp"
+  else
+    {
+      printf '# CommitIA - configuração (gerenciada por: %s --config)\n' "$SCRIPT_NAME"
+      printf '%s=%s\n' "$var" "$quoted"
+    } > "$tmp"
+  fi
+
+  if ! cat "$tmp" > "$file"; then
+    rm -f "$tmp"
+    error "Não foi possível gravar em $file"
+  fi
+  rm -f "$tmp"
+}
+
+# Remove todas as linhas VAR=... do arquivo
+config_remove_value() {
+  local file="$1" var="$2" tmp
+  tmp=$(mktemp) || error "Não foi possível criar um arquivo temporário"
+  awk -v key="$var" '
+    BEGIN { pat = "^[[:space:]]*(export[[:space:]]+)?" key "=" }
+    { sub(/\r$/, "") }
+    $0 ~ pat { next }
+    { print }
+  ' "$file" > "$tmp"
+  if ! cat "$tmp" > "$file"; then
+    rm -f "$tmp"
+    error "Não foi possível gravar em $file"
+  fi
+  rm -f "$tmp"
+}
+
+# Aviso (não bloqueante) quando o provedor escolhido ainda não está utilizável
+config_provider_hint() {
+  local bin="" install=""
+  case "$1" in
+    amp)        bin="amp";          install="https://ampcode.com" ;;
+    cursor)     bin="cursor-agent"; install="curl https://cursor.com/install -fsS | bash" ;;
+    copilot)    bin="copilot";      install="npm install -g @github/copilot" ;;
+    claude)     bin="claude";       install="npm install -g @anthropic-ai/claude-code" ;;
+    codex)      bin="codex";        install="npm install -g @openai/codex" ;;
+    gemini-cli) bin="gemini";       install="npm install -g @google/gemini-cli" ;;
+    ollama)     bin="ollama";       install="https://ollama.ai" ;;
+    openai)
+      [ -n "${OPENAI_API_KEY:-}" ] || warn "OPENAI_API_KEY não está definida neste ambiente"
+      return 0
+      ;;
+    gemini)
+      [ -n "${GEMINI_API_KEY:-}" ] || warn "GEMINI_API_KEY não está definida neste ambiente"
+      return 0
+      ;;
+  esac
+  if [ -n "$bin" ] && ! command -v "$bin" &>/dev/null; then
+    warn "'$bin' não foi encontrado no PATH. Instale com: $install"
+  fi
+  return 0
+}
+
+config_unknown_key() {
+  error "Chave desconhecida: '$1'. Chaves disponíveis: ${CONFIG_KEYS}"
+}
+
+# commitia --config  /  --config --list
+config_list() {
+  local scope="$1" key var value shown origin project_file="" global_state
+
+  project_file=$(get_project_config_file) || project_file=""
+
+  echo ""
+  if [ -n "$scope" ]; then
+    config_resolve_target "$scope"
+    echo -e "${BOLD}Configuração definida em ${CONFIG_TARGET_FILE}${NC}"
+  else
+    echo -e "${BOLD}Configuração efetiva do CommitIA${NC}"
+  fi
+  echo ""
+  printf "  ${BOLD}%-21s %-34s %s${NC}\n" "CHAVE" "VALOR" "ORIGEM"
+
+  for key in $CONFIG_KEYS; do
+    var=$(config_var_for_key "$key")
+    if [ -n "$scope" ]; then
+      value=$(config_file_get "$CONFIG_TARGET_FILE" "$var") || continue
+      origin="$scope"
+    else
+      config_effective "$key" "$var"
+      value="$CONFIG_VALUE"
+      origin="$CONFIG_SOURCE"
+    fi
+    shown="$value"
+    [ -n "$shown" ] || shown="-"
+    if [ ${#shown} -gt 32 ]; then shown="${shown:0:29}..."; fi
+    printf "  ${CYAN}%-21s${NC} %-34s ${YELLOW}%s${NC}\n" "$key" "$shown" "$origin"
+  done
+
+  echo ""
+  global_state="não existe"; [ -f "$CONFIG_FILE" ] && global_state="existe"
+  echo -e "  Global:  $CONFIG_FILE (${global_state})"
+  if [ -n "$project_file" ]; then
+    echo -e "  Projeto: $project_file (existe)"
+  elif git rev-parse --is-inside-work-tree &>/dev/null; then
+    echo -e "  Projeto: $(git rev-parse --show-toplevel 2>/dev/null)/.commitiarc (não existe)"
+  fi
+  echo ""
+  echo "  Linha de comando (--provider, --lang) tem prioridade sobre os arquivos."
+  echo ""
+}
+
+# commitia --config <chave>
+config_get() {
+  local key var scope="$2"
+  key=$(config_normalize_key "$1")
+  var=$(config_var_for_key "$key")
+  [ -n "$var" ] || config_unknown_key "$1"
+
+  if [ -n "$scope" ]; then
+    config_resolve_target "$scope"
+    config_file_get "$CONFIG_TARGET_FILE" "$var" || exit 1
+    echo ""
+    return 0
+  fi
+
+  config_effective "$key" "$var"
+  printf '%s\n' "$CONFIG_VALUE"
+}
+
+# commitia --config <chave> <valor>
+config_set() {
+  local key var value="$2" scope="${3:-global}" reason quoted other
+
+  key=$(config_normalize_key "$1")
+  var=$(config_var_for_key "$key")
+  [ -n "$var" ] || config_unknown_key "$1"
+
+  # Chaves de valor fixo aceitam qualquer caixa (Copilot, PT, TRUE...)
+  case "$key" in
+    provider|language|auto-stage|large-files)
+      value=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+      ;;
+  esac
+
+  if ! reason=$(config_validate "$key" "$value"); then
+    error "$key: $reason"
+  fi
+
+  config_resolve_target "$scope"
+  quoted=$(config_quote_value "$value")
+  config_write_value "$CONFIG_TARGET_FILE" "$var" "$quoted"
+
+  success "$key = ${value:-(vazio)}  [$scope: $CONFIG_TARGET_FILE]"
+
+  # Configuração global é sobrescrita pela do projeto atual, se houver
+  if [ "$scope" = "global" ]; then
+    other=$(get_project_config_file) || other=""
+    if [ -n "$other" ] && config_file_get "$other" "$var" >/dev/null; then
+      warn "O projeto atual define $var em $other, que tem prioridade sobre a configuração global"
+    fi
+  elif ! git check-ignore -q -- "$CONFIG_TARGET_FILE" 2>/dev/null; then
+    warn "$CONFIG_TARGET_FILE não está no .gitignore; evite commitar configurações pessoais"
+  fi
+
+  [ "$key" = "provider" ] && config_provider_hint "$value"
+  return 0
+}
+
+# commitia --config --unset <chave>
+config_unset() {
+  local key var scope="${2:-global}"
+  key=$(config_normalize_key "$1")
+  var=$(config_var_for_key "$key")
+  [ -n "$var" ] || config_unknown_key "$1"
+
+  config_resolve_target "$scope"
+  if ! config_file_get "$CONFIG_TARGET_FILE" "$var" >/dev/null; then
+    info "$key não está definida em $CONFIG_TARGET_FILE (nada a remover)"
+    return 0
+  fi
+  config_remove_value "$CONFIG_TARGET_FILE" "$var"
+  success "$key removida de $CONFIG_TARGET_FILE (volta ao padrão ou ao outro nível)"
+}
+
+do_config() {
+  local n=${#CONFIG_ARGS[@]}
+
+  if [ "$CONFIG_UNSET" = true ]; then
+    [ "$n" -eq 1 ] || error "Uso: $SCRIPT_NAME --config [--local|--global] --unset <chave>"
+    config_unset "${CONFIG_ARGS[0]}" "$CONFIG_SCOPE"
+    return 0
+  fi
+
+  case "$n" in
+    0) config_list "$CONFIG_SCOPE" ;;
+    1)
+      if [ "$CONFIG_LIST" = true ]; then
+        error "--list não aceita chave; use: $SCRIPT_NAME --config <chave>"
+      fi
+      config_get "${CONFIG_ARGS[0]}" "$CONFIG_SCOPE"
+      ;;
+    2)
+      if [ "$CONFIG_LIST" = true ]; then
+        error "--list não aceita chave/valor"
+      fi
+      config_set "${CONFIG_ARGS[0]}" "${CONFIG_ARGS[1]}" "$CONFIG_SCOPE"
+      ;;
+    *)
+      error "Uso: $SCRIPT_NAME --config [--local|--global] <chave> [valor] (valores com espaço devem vir entre aspas)"
+      ;;
+  esac
+}
+
 # ============================================================================
 # Extração de informações
 # ============================================================================
@@ -1586,14 +2047,32 @@ run_with_timeout() {
   fi
 }
 
-# Monta o prompt completo (instruções + diff) para as CLIs de IA
+# Limite do prompt quando ele vai como argumento de linha de comando (cursor, copilot).
+# O Windows aceita ~32 mil caracteres na linha de comando inteira, então no Windows
+# usamos 24 mil (sobra espaço para as opções). 0 = sem limite extra (Linux/macOS).
+if [ -z "${COMMITIA_ARG_MAX_CHARS+x}" ]; then
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) COMMITIA_ARG_MAX_CHARS=24000 ;;
+    *) COMMITIA_ARG_MAX_CHARS=0 ;;
+  esac
+fi
+
+# Monta o prompt completo (instruções + diff) para as CLIs de IA.
+# $2 = "argv" quando o prompt vai como argumento: o diff é reduzido para caber no limite.
 build_cli_prompt() {
-  local prompt="$1"
-  local diff
+  local prompt="$1" mode="${2:-stdin}"
+  local diff max="$COMMITIA_MAX_DIFF_CHARS"
   diff=$(get_staged_diff)
 
-  if [ ${#diff} -gt "$COMMITIA_MAX_DIFF_CHARS" ]; then
-    diff="${diff:0:$COMMITIA_MAX_DIFF_CHARS}"$'\n'"... [diff truncado]"
+  if [ "$mode" = "argv" ] && [ "$COMMITIA_ARG_MAX_CHARS" -gt 0 ]; then
+    # Reserva espaço para as instruções e para as opções da CLI
+    local room=$(( COMMITIA_ARG_MAX_CHARS - ${#prompt} - 400 ))
+    [ "$room" -lt 0 ] && room=0
+    [ "$room" -lt "$max" ] && max="$room"
+  fi
+
+  if [ ${#diff} -gt "$max" ]; then
+    diff="${diff:0:$max}"$'\n'"... [diff truncado]"
   fi
 
   if [ "$DIFF_MODE" = "summary" ]; then
@@ -1605,7 +2084,7 @@ build_cli_prompt() {
 
 generate_with_cursor() {
   local full_prompt
-  full_prompt=$(build_cli_prompt "$1")
+  full_prompt=$(build_cli_prompt "$1" argv)
 
   # --mode ask: somente leitura (sem edições nem comandos)
   local args=(-p --mode ask --output-format text)
@@ -1616,7 +2095,7 @@ generate_with_cursor() {
 
 generate_with_copilot() {
   local full_prompt
-  full_prompt=$(build_cli_prompt "$1")
+  full_prompt=$(build_cli_prompt "$1" argv)
 
   # -s: apenas a resposta; --deny-tool: bloqueia shell e escrita de arquivos
   local args=(-s --no-color --no-ask-user --no-custom-instructions --no-auto-update
@@ -2154,7 +2633,7 @@ fallback_commit_message() {
       scope="${scope%.*}"
       [ -n "$scope" ] || scope="${f##*/}"
     fi
-    scope=$(printf '%s' "$scope" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-\n' '-')
+    scope=$(printf '%s' "$scope" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._\n-' '-')
     scope="${scope#-}"
     scope="${scope%-}"
   fi
@@ -2295,12 +2774,15 @@ commit_staged_group() {
         return 1
       fi
       if [ "$allow_fallback" != true ]; then
-        echo ""
+        echo "" >&2
         echo -e "${RED}✗ Erro: Não foi possível gerar a mensagem de commit${NC}" >&2
+        show_error_excerpt "$COMMITIA_RAW_OUTPUT"
+        show_error_hint "$COMMITIA_RAW_OUTPUT"
         echo -e "  Log gravado em: ${BOLD}$LOG_PATH${NC}" >&2
         return 1
       fi
       warn "A IA falhou com o diff completo (log: $LOG_PATH)"
+      show_error_excerpt "$COMMITIA_RAW_OUTPUT" 4
     fi
   fi
 
@@ -2331,6 +2813,7 @@ commit_staged_group() {
         return 1
       fi
       warn "A IA também falhou com o resumo (log: $LOG_PATH)"
+      show_error_excerpt "$COMMITIA_RAW_OUTPUT" 4
       # Fallback 2 (último recurso): mensagem determinística
       COMMIT_MSG=$(fallback_commit_message)
       MSG_SOURCE="minimo"
@@ -2392,8 +2875,10 @@ commit_staged_group() {
     "$COMMITIA_COMMIT_STDERR" \
     "$(get_staged_files)" \
     "$(git branch --show-current 2>/dev/null || echo '')")
-  echo ""
+  echo "" >&2
   echo -e "${RED}✗ Erro: Falha ao realizar commit${NC}" >&2
+  show_error_excerpt "$COMMITIA_COMMIT_STDERR"
+  show_error_hint "$COMMITIA_COMMIT_STDERR"
   echo -e "  Log gravado em: ${BOLD}$LOG_PATH${NC}" >&2
   return 1
 }
@@ -2883,6 +3368,13 @@ main() {
   CLI_LANGUAGE=""
   CLI_AUTO_STAGE=""
   DO_UPDATE=false
+
+  # Modo --config (ver seção "Configuração pela linha de comando")
+  DO_CONFIG=false
+  CONFIG_ARGS=()
+  CONFIG_SCOPE=""
+  CONFIG_UNSET=false
+  CONFIG_LIST=false
   
   while [[ $# -gt 0 ]]; do
     case $1 in
@@ -2938,15 +3430,51 @@ main() {
         CLI_LANGUAGE="$2"
         shift 2
         ;;
+      --config)
+        DO_CONFIG=true
+        shift
+        ;;
+      --local)
+        CONFIG_SCOPE="local"
+        shift
+        ;;
+      --global)
+        CONFIG_SCOPE="global"
+        shift
+        ;;
+      --unset)
+        CONFIG_UNSET=true
+        shift
+        ;;
+      --list)
+        CONFIG_LIST=true
+        shift
+        ;;
       -*)
         error "Opção desconhecida: $1"
         ;;
       *)
-        FILES+=("$1")
+        # Com --config, os argumentos posicionais são "chave [valor]"
+        if [ "$DO_CONFIG" = true ]; then
+          CONFIG_ARGS+=("$1")
+        else
+          FILES+=("$1")
+        fi
         shift
         ;;
     esac
   done
+
+  # --local/--global/--unset/--list só fazem sentido junto de --config
+  if [ "$DO_CONFIG" != true ] && { [ -n "$CONFIG_SCOPE" ] || [ "$CONFIG_UNSET" = true ] || [ "$CONFIG_LIST" = true ]; }; then
+    error "--local, --global, --unset e --list só podem ser usados com --config"
+  fi
+
+  # Executa --config (não precisa de repositório Git nem do provedor de IA)
+  if [ "$DO_CONFIG" = true ]; then
+    do_config
+    exit 0
+  fi
   
   # Executa update se solicitado
   if [ "$DO_UPDATE" = true ]; then

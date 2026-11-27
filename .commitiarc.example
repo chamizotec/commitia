@@ -2,6 +2,10 @@
 # CommitIA - Arquivo de Configuração
 # ============================================================================
 # Copie este arquivo para ~/.commitiarc e ajuste conforme necessário.
+# Ou defina as chaves pela linha de comando, sem editar o arquivo:
+#   commitia --config provider copilot          (global)
+#   commitia --config --local provider claude   (só este projeto)
+#   commitia --config                           (lista a configuração efetiva)
 # Todas as configurações também podem ser definidas via variáveis de ambiente.
 # ============================================================================
 

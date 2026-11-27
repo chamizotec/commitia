@@ -4,9 +4,7 @@
 
 CommitIA analisa suas alterações no Git e gera automaticamente mensagens de commit semânticas, seguindo as melhores práticas do [Conventional Commits](https://www.conventionalcommits.org/).
 
-<p align="center">
-  <img src="docs/demo.gif" alt="Demo do CommitIA" width="600">
-</p>
+![Demo do CommitIA](docs/demo.gif)
 
 ## ✨ Funcionalidades
 
@@ -28,7 +26,7 @@ CommitIA analisa suas alterações no Git e gera automaticamente mensagens de co
 curl -fsSL https://raw.githubusercontent.com/chamizotec/commitia/refs/heads/main/install.sh | bash
 ```
 
-### Instalação manual
+### Instalação manual (Mac & Linux & WSL)
 
 ```bash
 # Clone o repositório
@@ -38,6 +36,17 @@ cd commitia
 # Execute o instalador
 ./install.sh
 ```
+
+### Windows (PowerShell / CMD)
+
+Funciona direto no Windows, sem WSL. É preciso ter o [Git para Windows](https://git-scm.com/download/win) (que traz o Git Bash). O instalador `commitia-setup.exe` (gerado em `installer/commitia.iss`, veja `docs/INSTALL.md`) coloca o comando `commitia` no PATH do usuário e não exige administrador:
+
+```powershell
+commitia --version
+commitia --config provider copilot
+```
+
+O comando é um atalho (`commitia.cmd`) que chama o mesmo script bash (`bin/commitia`) pelo Git Bash: há um único código para manter e testar. ++**Instalação nos Releases.**++
 
 ### Homebrew (em breve)
 
@@ -97,6 +106,7 @@ commitia -a
 | `--lang <idioma>`       | Idioma da mensagem (pt, en, es)       |
 | `--update`              | Atualiza para a versão mais recente   |
 | `--force`               | Reinstala mesmo na versão atual (com `--update`) |
+| `--config [chave [valor]]` | Mostra ou define configurações ([detalhes](#configuração-pela-linha-de-comando)) |
 | `-v, --version`         | Mostra a versão                       |
 | `-h, --help`            | Mostra ajuda                          |
 
@@ -117,6 +127,43 @@ commitia -a
 | `revert`   | Reversão                      |
 
 ## ⚙️ Configuração
+
+### Configuração pela linha de comando
+
+Não precisa editar arquivos: use `--config`. Funciona igual no macOS, Linux e Windows (PowerShell, CMD ou Git Bash).
+
+```bash
+# Usar o GitHub Copilot como provedor (grava em ~/.commitiarc)
+commitia --config provider copilot
+
+# Mostrar o valor de uma chave
+commitia --config provider
+
+# Listar tudo (valor efetivo e de onde ele vem: projeto, global, ambiente ou padrão)
+commitia --config
+
+# Definir só para o projeto atual (grava em <raiz do repo>/.commitiarc)
+commitia --config --local provider claude
+
+# Remover uma chave (volta ao padrão ou ao outro nível)
+commitia --config --unset provider
+commitia --config --local --unset provider
+```
+
+| Complemento | Efeito                                                              |
+| ----------- | ------------------------------------------------------------------- |
+| `--global`  | Arquivo global `~/.commitiarc` (padrão; no Windows `%USERPROFILE%\.commitiarc`) |
+| `--local`   | Arquivo do projeto `.commitiarc` na raiz do repositório Git         |
+| `--unset`   | Remove a chave do arquivo escolhido                                 |
+| `--list`    | Lista as chaves (com `--local`/`--global`, só as definidas no arquivo) |
+
+**Chaves disponíveis:** `provider`, `language` (ou `lang`), `auto-stage`, `large-files`, `large-file-lines`, `large-file-bytes`, `large-file-patterns`, `cli-timeout`, `max-diff-chars`, `cursor-model`, `copilot-model`, `claude-model`, `codex-model`, `gemini-cli-model`, `gemini-model`. Também são aceitos os nomes de variável, como `COMMITIA_PROVIDER`.
+
+- Os valores são validados (ex.: `provider` só aceita `amp`, `openai`, `gemini`, `ollama`, `cursor`, `copilot`, `claude`, `codex` ou `gemini-cli`).
+- Ao definir um provedor cuja CLI não está instalada, o CommitIA avisa como instalá-la.
+- Valores com espaço precisam estar entre aspas: `commitia --config large-file-patterns "pnpm-lock.yaml yarn.lock"`.
+- O restante do arquivo (comentários e outras variáveis) é preservado.
+- `--provider` e `--lang` na linha de comando continuam tendo prioridade sobre os arquivos.
 
 ### Ordem de prioridade
 
@@ -414,7 +461,7 @@ cd commitia
 
 ## 📌 Versão e releases
 
-A versão fica em `bin/commitia` (variável `VERSION`). Ao fazer **push na branch `main`**, um [GitHub Action](.github/workflows/bump-version.yml) incrementa automaticamente o **patch** (ex.: `1.0.9` → `1.0.10`), faz commit e push do bump. Commits cuja mensagem já for um bump de versão são ignorados para evitar loop.
+A versão fica em `bin/commitia` (variável `VERSION`). Ao fazer **push na branch** `main`, um [GitHub Action](.github/workflows/bump-version.yml) incrementa automaticamente o **patch** (ex.: `1.0.9` → `1.0.10`), faz commit e push do bump. Commits cuja mensagem já for um bump de versão são ignorados para evitar loop.
 
 ### Automação local: push + pull
 
@@ -458,6 +505,4 @@ Este projeto está sob a licença MIT. Veja o arquivo [LICENSE](LICENSE) para ma
 
 ---
 
-<p align="center">
-  Feito com ❤️ para desenvolvedores que querem commits melhores
-</p>
+Feito com ❤️ para desenvolvedores que querem commits melhores

@@ -101,9 +101,37 @@ cd commitia
 COMMITIA_INSTALL_DIR=/usr/local/bin ./install.sh
 ```
 
+### Windows (PowerShell / CMD, sem WSL)
+
+O CommitIA roda no Windows puro usando o Git Bash que vem com o [Git para Windows](https://git-scm.com/download/win). Um pequeno atalho (`installer/commitia.cmd`) chama o mesmo script bash (`bin/commitia`), então o comando `commitia` funciona igual no PowerShell, no CMD e no Git Bash.
+
+**Pelo instalador** (recomendado, não exige administrador):
+
+1. Instale o [Inno Setup 6 ou superior](https://jrsoftware.org/isinfo.php).
+2. Gere o instalador (a versão sai de `VERSION` em `bin/commitia`):
+
+   ```powershell
+   & "C:\Program Files\Inno Setup 7\ISCC.exe" /DAppVersion=1.0.16 installer\commitia.iss
+   ```
+
+   (o caminho muda conforme a versão instalada, ex.: `Inno Setup 6`). O resultado fica em `dist\commitia-setup.exe`.
+3. Execute `dist\commitia-setup.exe`. Ele instala em `%LOCALAPPDATA%\commitia`, adiciona a pasta ao PATH do usuário e grava `COMMITIA_GIT_BASH`. Se o Git não existir, oferece instalar com o `winget`.
+4. Abra um **novo** terminal e teste:
+
+   ```powershell
+   commitia --version
+   commitia --config provider copilot
+   ```
+
+O arquivo de configuração global fica em `%USERPROFILE%\.commitiarc` (o mesmo `~/.commitiarc` do Git Bash) e pode ser editado no Bloco de Notas: finais de linha CRLF são aceitos.
+
+> `bash.exe` em `C:\Windows\System32` é o WSL e não é usado. O atalho procura sempre o Git Bash (ou o caminho em `COMMITIA_GIT_BASH`).
+
+Para rodar os testes no Windows: `& "C:\Program Files\Git\bin\bash.exe" tests/run_tests.sh`.
+
 ### Windows (WSL)
 
-O CommitIA funciona no Windows através do WSL (Windows Subsystem for Linux).
+O CommitIA também funciona no Windows através do WSL (Windows Subsystem for Linux).
 
 1. Instale o WSL:
 
@@ -149,7 +177,14 @@ commitia --help
 
 ## Configuração Inicial
 
-Após a instalação, configure o CommitIA:
+Após a instalação, configure o CommitIA. O jeito mais rápido é pela linha de comando (macOS, Linux e Windows):
+
+```bash
+commitia --config provider copilot   # define o provedor de IA (global)
+commitia --config                    # lista a configuração efetiva
+```
+
+Veja todas as opções em "Configuração pela linha de comando" no README. Se preferir editar o arquivo à mão:
 
 ```bash
 # Copie o arquivo de exemplo
