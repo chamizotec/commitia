@@ -4,9 +4,7 @@
 
 CommitIA analisa suas alterações no Git e gera automaticamente mensagens de commit semânticas, seguindo as melhores práticas do [Conventional Commits](https://www.conventionalcommits.org/).
 
-<p align="center">
-  <img src="docs/demo.gif" alt="Demo do CommitIA" width="600">
-</p>
+![Demo do CommitIA](docs/demo.gif)
 
 ## ✨ Funcionalidades
 
@@ -26,7 +24,7 @@ CommitIA analisa suas alterações no Git e gera automaticamente mensagens de co
 curl -fsSL https://raw.githubusercontent.com/chamizotec/commitia/refs/heads/main/install.sh | bash
 ```
 
-### Instalação manual
+### Instalação manual (Mac & Linux & WSL)
 
 ```bash
 # Clone o repositório
@@ -46,7 +44,7 @@ commitia --version
 commitia --config provider copilot
 ```
 
-O comando é um atalho (`commitia.cmd`) que chama o mesmo script bash (`bin/commitia`) pelo Git Bash: há um único código para manter e testar.
+O comando é um atalho (`commitia.cmd`) que chama o mesmo script bash (`bin/commitia`) pelo Git Bash: há um único código para manter e testar. ++**Instalação nos Releases.**++
 
 ### Homebrew (em breve)
 
@@ -344,7 +342,7 @@ cd commitia
 
 ## 📌 Versão e releases
 
-A versão fica em `bin/commitia` (variável `VERSION`). Ao fazer **push na branch `main`**, um [GitHub Action](.github/workflows/bump-version.yml) incrementa automaticamente o **patch** (ex.: `1.0.9` → `1.0.10`), faz commit e push do bump. Commits cuja mensagem já for um bump de versão são ignorados para evitar loop.
+A versão fica em `bin/commitia` (variável `VERSION`). Ao fazer **push na branch** `main`, um [GitHub Action](.github/workflows/bump-version.yml) incrementa automaticamente o **patch** (ex.: `1.0.9` → `1.0.10`), faz commit e push do bump. Commits cuja mensagem já for um bump de versão são ignorados para evitar loop.
 
 ### Automação local: push + pull
 
@@ -388,6 +386,4 @@ Este projeto está sob a licença MIT. Veja o arquivo [LICENSE](LICENSE) para ma
 
 ---
 
-<p align="center">
-  Feito com ❤️ para desenvolvedores que querem commits melhores
-</p>
+Feito com ❤️ para desenvolvedores que querem commits melhores
