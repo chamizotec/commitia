@@ -878,6 +878,17 @@ test_cli_outdated_large_files_summary_fallback() {
 # interativo simulado com COMMITIA_TEST_FORCE_TTY e a resposta em stdin)
 # ----------------------------------------------------------------------------
 
+# URL file:// de um diretório local. No Windows (Git Bash) o curl é nativo e não
+# entende caminhos como /tmp/...; cygpath -m converte para C:/Users/... (no
+# macOS/Linux não há cygpath e o caminho é usado como está).
+file_url() {
+  if command -v cygpath &>/dev/null; then
+    printf 'file:///%s' "$(cygpath -m "$1")"
+  else
+    printf 'file://%s' "$1"
+  fi
+}
+
 # Cópia do commitia com outra VERSION; imprime "EXEC-VERSAO-<versão>" quando
 # COMMITIA_TEST_MARK está definido (prova qual versão rodou)
 make_commitia_copy() {
@@ -904,7 +915,7 @@ teardown_update_env() {
 
 # commitia instalado (cópia) com checagem de versão ligada e terminal simulado
 up_commitia() {
-  lg_commitia COMMITIA_SKIP_UPDATE_CHECK=false COMMITIA_REPO_RAW_URL="file://$LG_DIR/remote" \
+  lg_commitia COMMITIA_SKIP_UPDATE_CHECK=false COMMITIA_REPO_RAW_URL="$(file_url "$LG_DIR/remote")" \
     COMMITIA_TEST_FORCE_TTY=true COMMITIA_TEST_MARK=1 "$@"
 }
 
@@ -1133,11 +1144,11 @@ test_update_not_on_help_version_update() {
   make_fake_curl
   local out
   out=$(cd "$LG_REPO" && env HOME="$LG_DIR/home" PATH="$LG_DIR/bin:$PATH" COMMITIA_SKIP_UPDATE_CHECK=false \
-    COMMITIA_TEST_FORCE_TTY=true COMMITIA_REPO_RAW_URL="file://$LG_DIR/remote" \
+    COMMITIA_TEST_FORCE_TTY=true COMMITIA_REPO_RAW_URL="$(file_url "$LG_DIR/remote")" \
     "$LG_DIR/inst/commitia" --version 2>&1 </dev/null)
   expect_contains "--version funciona" "$out" "CommitIA v1.0.0"
   out=$(cd "$LG_REPO" && env HOME="$LG_DIR/home" PATH="$LG_DIR/bin:$PATH" COMMITIA_SKIP_UPDATE_CHECK=false \
-    COMMITIA_TEST_FORCE_TTY=true COMMITIA_REPO_RAW_URL="file://$LG_DIR/remote" \
+    COMMITIA_TEST_FORCE_TTY=true COMMITIA_REPO_RAW_URL="$(file_url "$LG_DIR/remote")" \
     "$LG_DIR/inst/commitia" --help 2>&1 </dev/null)
   expect_contains "--help documenta COMMITIA_SKIP_UPDATE_CHECK" "$out" "COMMITIA_SKIP_UPDATE_CHECK"
   expect_contains "--help documenta COMMITIA_UPDATE_CHECK_INTERVAL_HOURS" "$out" "COMMITIA_UPDATE_CHECK_INTERVAL_HOURS"
@@ -1148,7 +1159,7 @@ test_update_not_on_help_version_update() {
   # --update: usa o commitia do PATH, pergunta uma vez (próprio prompt) e reinstala
   setup_update_env
   out=$(cd "$LG_REPO" && printf 's' | env HOME="$LG_DIR/home" PATH="$LG_DIR/inst:$PATH" \
-    COMMITIA_REPO_RAW_URL="file://$LG_DIR/remote" COMMITIA_SKIP_UPDATE_CHECK=false \
+    COMMITIA_REPO_RAW_URL="$(file_url "$LG_DIR/remote")" COMMITIA_SKIP_UPDATE_CHECK=false \
     "$LG_DIR/inst/commitia" --update 2>&1 | strip_ansi)
   expect_contains "--update: informa as versões" "$out" "Versão remota: 9.9.9"
   expect_contains "--update: atualiza com sucesso" "$out" "Atualizado com sucesso para a versão 9.9.9"
@@ -1156,10 +1167,10 @@ test_update_not_on_help_version_update() {
   expect_not_contains "--update: não dispara a checagem automática" "$out" "Nova versão"
   # Já na última versão: informa; --force reinstala
   out=$(cd "$LG_REPO" && printf 's' | env HOME="$LG_DIR/home" PATH="$LG_DIR/inst:$PATH" \
-    COMMITIA_REPO_RAW_URL="file://$LG_DIR/remote" "$LG_DIR/inst/commitia" --update 2>&1 | strip_ansi)
+    COMMITIA_REPO_RAW_URL="$(file_url "$LG_DIR/remote")" "$LG_DIR/inst/commitia" --update 2>&1 | strip_ansi)
   expect_contains "--update: já na versão mais recente" "$out" "Você já está na versão mais recente"
   out=$(cd "$LG_REPO" && printf 's' | env HOME="$LG_DIR/home" PATH="$LG_DIR/inst:$PATH" \
-    COMMITIA_REPO_RAW_URL="file://$LG_DIR/remote" "$LG_DIR/inst/commitia" --update --force 2>&1 | strip_ansi)
+    COMMITIA_REPO_RAW_URL="$(file_url "$LG_DIR/remote")" "$LG_DIR/inst/commitia" --update --force 2>&1 | strip_ansi)
   expect_contains "--update --force: reinstala" "$out" "Reinstalar a mesma versão 9.9.9"
   expect_contains "--update --force: conclui" "$out" "Atualizado com sucesso"
   teardown_update_env
