@@ -17,6 +17,11 @@ COMMITIA="$SCRIPT_DIR/../bin/commitia"
 TESTS_PASSED=0
 TESTS_FAILED=0
 
+# Os testes nunca consultam a rede real: a checagem de nova versão fica desligada
+# por padrão (os testes dela a ligam explicitamente, com origem local/curl falso)
+export COMMITIA_SKIP_UPDATE_CHECK=true
+unset COMMITIA_UPDATED_REEXEC COMMITIA_REPO_RAW_URL COMMITIA_TEST_FORCE_TTY
+
 pass() {
   echo -e "${GREEN}✓ PASS:${NC} $1"
   TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -174,8 +179,17 @@ EOF
   for cli in cursor-agent copilot claude codex gemini; do
     # --help da CLI falsa "atualizada" (arquivo ao lado do executável)
     fake_help_text "$cli" > "$FAKE_DIR/cli/$cli.help"
+    # --help da versão nova (usado pelo "update" falso)
+    fake_help_text "$cli" > "$FAKE_DIR/cli/$cli.help.new"
     cat > "$FAKE_DIR/cli/$cli" << 'EOF'
 #!/usr/bin/env bash
+# 'update' (cursor-agent update): "atualiza" trocando o --help pelo da versão nova
+if [ "$1" = "update" ]; then
+  [ -n "$FAKE_UPDATE_FAIL" ] && exit 1
+  echo "$*" >> "$0.updated"
+  [ -n "$FAKE_UPDATE_NOFIX" ] || cp "$0.help.new" "$0.help"
+  exit 0
+fi
 # --version / --help não consomem stdin nem geram mensagem
 case "$*" in
   *--version*) echo "1.2.3 (fake)"; exit 0 ;;
@@ -200,8 +214,23 @@ else
 fi
 EOF
   done
+  # npm falso: "npm install -g <pacote>@latest" atualiza a CLI falsa correspondente
+  cat > "$FAKE_DIR/cli/npm" << 'EOF3'
+#!/usr/bin/env bash
+echo "$*" >> "$FAKE_NPM_LOG"
+[ -n "$FAKE_UPDATE_FAIL" ] && exit 1
+case "$*" in
+  "install -g @github/copilot@latest") bin=copilot ;;
+  "install -g @anthropic-ai/claude-code@latest") bin=claude ;;
+  "install -g @openai/codex@latest") bin=codex ;;
+  "install -g @google/gemini-cli@latest") bin=gemini ;;
+  *) exit 1 ;;
+esac
+[ -n "$FAKE_UPDATE_NOFIX" ] || cp "$(dirname "$0")/$bin.help.new" "$(dirname "$0")/$bin.help"
+EOF3
   chmod +x "$FAKE_DIR"/git/git "$FAKE_DIR"/cli/*
   export FAKE_REPO="$FAKE_DIR/repo"
+  export FAKE_NPM_LOG="$FAKE_DIR/npm.log"
 }
 
 test_unknown_provider() {
@@ -314,10 +343,10 @@ lg_commitia() {
       *) break ;;
     esac
   done
-  LG_OUT=$( (cd "$LG_REPO" && env -u FAKE_FAIL_MATCH -u FAKE_FAIL_MATCH2 -u FAKE_RUNTIME_ERROR -u COMMITIA_LARGE_FILES -u COMMITIA_LARGE_FILE_LINES \
+  LG_OUT=$( (cd "$LG_REPO" && { [ -z "${LG_STDIN+x}" ] || exec < <(printf '%b' "$LG_STDIN"); } && env -u FAKE_FAIL_MATCH -u FAKE_FAIL_MATCH2 -u FAKE_RUNTIME_ERROR -u COMMITIA_LARGE_FILES -u COMMITIA_LARGE_FILE_LINES \
     -u COMMITIA_LARGE_FILE_BYTES -u COMMITIA_LARGE_FILE_PATTERNS \
     HOME="$LG_DIR/home" PATH="$LG_DIR/bin:$PATH" FAKE_OUT="$LG_DIR/out" \
-    ${envs[@]+"${envs[@]}"} "$COMMITIA" --provider claude "$@" 2>&1; echo "RC=$?") | perl -pe 's/\e\[[0-9;]*m//g')
+    ${envs[@]+"${envs[@]}"} "${LG_COMMITIA:-$COMMITIA}" --provider claude "$@" 2>&1; echo "RC=$?") | perl -pe 's/\e\[[0-9;]*m//g')
   LG_RC=$(echo "$LG_OUT" | sed -n 's/^RC=//p')
   LG_OUT=$(echo "$LG_OUT" | sed '/^RC=[0-9]*$/d')
 }
@@ -835,6 +864,912 @@ test_cli_outdated_large_files_summary_fallback() {
 }
 
 # ----------------------------------------------------------------------------
+# Validação de versão do commitia (hermético: origem remota local via file://,
+# instalação em diretório temporário, curl falso para offline; terminal
+# interativo simulado com COMMITIA_TEST_FORCE_TTY e a resposta em stdin)
+# ----------------------------------------------------------------------------
+
+# Cópia do commitia com outra VERSION; imprime "EXEC-VERSAO-<versão>" quando
+# COMMITIA_TEST_MARK está definido (prova qual versão rodou)
+make_commitia_copy() {
+  perl -pe "s/^VERSION=.*/VERSION=\"$2\"/; \$_ .= \"[ -z \\\"\\\${COMMITIA_TEST_MARK:-}\\\" ] || echo \\\"EXEC-VERSAO-\\\${VERSION}\\\"\\n\" if /^VERSION=/" "$COMMITIA" > "$1"
+  chmod +x "$1"
+}
+
+# $1: versão local (padrão 1.0.0); $2: versão remota (padrão 9.9.9)
+setup_update_env() {
+  setup_large_env
+  UP_LOCAL="${1:-1.0.0}"
+  UP_REMOTE="${2:-9.9.9}"
+  mkdir -p "$LG_DIR/remote/bin" "$LG_DIR/inst"
+  make_commitia_copy "$LG_DIR/remote/bin/commitia" "$UP_REMOTE"
+  make_commitia_copy "$LG_DIR/inst/commitia" "$UP_LOCAL"
+  LG_COMMITIA="$LG_DIR/inst/commitia"
+  echo 'echo a' > "$LG_REPO/app.sh"
+}
+
+teardown_update_env() {
+  unset LG_COMMITIA LG_STDIN
+  teardown_large_env
+}
+
+# commitia instalado (cópia) com checagem de versão ligada e terminal simulado
+up_commitia() {
+  lg_commitia COMMITIA_SKIP_UPDATE_CHECK=false COMMITIA_REPO_RAW_URL="file://$LG_DIR/remote" \
+    COMMITIA_TEST_FORCE_TTY=true COMMITIA_TEST_MARK=1 "$@"
+}
+
+up_installed_version() { grep -m1 '^VERSION=' "$LG_DIR/inst/commitia" | cut -d'"' -f2; }
+
+# curl falso: registra os argumentos e falha como em timeout (exit 28)
+make_fake_curl() {
+  cat > "$LG_DIR/bin/curl" << 'EOF4'
+#!/usr/bin/env bash
+echo "$*" >> "$FAKE_CURL_LOG"
+exit 28
+EOF4
+  chmod +x "$LG_DIR/bin/curl"
+  FAKE_CURL_LOG="$LG_DIR/curl.log"
+  export FAKE_CURL_LOG
+}
+
+# (A1) Remota maior + "s": atualiza, reexecuta e o commit é feito pela versão nova
+test_update_accept() {
+  large_tests_available || return 0
+  setup_update_env
+  LG_STDIN='s\n' up_commitia
+  expect_eq "Atualização (s): sai com sucesso" "$LG_RC" "0"
+  expect_contains "Atualização (s): informa a nova versão" "$LG_OUT" "Nova versão 9.9.9 disponível (você está na 1.0.0)"
+  expect_contains "Atualização (s): pergunta se deseja atualizar" "$LG_OUT" "Deseja atualizar agora? [S/n]"
+  expect_contains "Atualização (s): confirma a atualização" "$LG_OUT" "Atualizado para a versão 9.9.9"
+  expect_eq "Atualização (s): binário instalado atualizado" "$(up_installed_version)" "9.9.9"
+  expect_contains "Atualização (s): versão antiga iniciou o fluxo" "$LG_OUT" "EXEC-VERSAO-1.0.0"
+  expect_contains "Atualização (s): reexecuta a versão nova" "$LG_OUT" "EXEC-VERSAO-9.9.9"
+  expect_eq "Atualização (s): pergunta uma única vez (sem loop)" "$(printf '%s\n' "$LG_OUT" | grep -c 'Nova versão')" "1"
+  expect_eq "Atualização (s): commit aplicado depois de atualizar" "$(lg_count)" "2"
+  expect_eq "Atualização (s): IA chamada uma única vez" "$(lg_nprompts)" "1"
+  expect_eq "Atualização (s): sem arquivos temporários na instalação" "$(ls "$LG_DIR/inst")" "commitia"
+  teardown_update_env
+
+  # Enter (resposta vazia) equivale a "sim" ([S/n])
+  setup_update_env
+  LG_STDIN='\n' up_commitia
+  expect_eq "Atualização (Enter): atualiza" "$(up_installed_version)" "9.9.9"
+  expect_eq "Atualização (Enter): commit aplicado" "$(lg_count)" "2"
+  teardown_update_env
+}
+
+# (A2) Remota maior + "n": segue normalmente com a versão atual
+test_update_decline() {
+  large_tests_available || return 0
+  setup_update_env
+  LG_STDIN='n\n' up_commitia
+  expect_eq "Atualização (n): sai com sucesso" "$LG_RC" "0"
+  expect_contains "Atualização (n): avisa a nova versão" "$LG_OUT" "Nova versão 9.9.9 disponível"
+  expect_contains "Atualização (n): segue com a versão atual" "$LG_OUT" "Seguindo com a versão atual (1.0.0)"
+  expect_eq "Atualização (n): binário intacto" "$(up_installed_version)" "1.0.0"
+  expect_not_contains "Atualização (n): não reexecuta" "$LG_OUT" "EXEC-VERSAO-9.9.9"
+  expect_eq "Atualização (n): commit aplicado" "$(lg_count)" "2"
+  teardown_update_env
+}
+
+# (A3) Offline/timeout: silencioso, sem erro, sem atraso repetido, com timeout curto
+test_update_offline() {
+  large_tests_available || return 0
+  setup_update_env
+  make_fake_curl
+  LG_STDIN='s\n' up_commitia
+  expect_eq "Offline: commit aplicado normalmente" "$(lg_count)" "2"
+  expect_eq "Offline: sai com sucesso" "$LG_RC" "0"
+  expect_not_contains "Offline: sem aviso de versão" "$LG_OUT" "Nova versão"
+  expect_not_contains "Offline: sem pergunta" "$LG_OUT" "Deseja atualizar"
+  expect_not_contains "Offline: sem erro" "$LG_OUT" "Erro"
+  expect_not_contains "Offline: sem aviso" "$LG_OUT" "Aviso"
+  expect_not_contains "Offline: sem erro do curl" "$LG_OUT" "curl"
+  expect_contains "Offline: curl com timeout curto (3s)" "$(cat "$FAKE_CURL_LOG")" "--max-time 3"
+  expect_eq "Offline: binário intacto" "$(up_installed_version)" "1.0.0"
+
+  # Segunda execução: a falha ficou em cache (sem pagar a latência da rede de novo)
+  echo 'echo b' > "$LG_REPO/app.sh"
+  LG_STDIN='s\n' up_commitia
+  expect_eq "Offline: não tenta a rede de novo logo em seguida" "$(wc -l < "$FAKE_CURL_LOG" | tr -d ' ')" "1"
+  expect_eq "Offline: segundo commit aplicado" "$(lg_count)" "3"
+  teardown_update_env
+}
+
+# (A4) Cache: respeita o intervalo, avisa enquanto pendente e revalida depois do prazo
+test_update_cache() {
+  large_tests_available || return 0
+  setup_update_env
+  local cache="$LG_DIR/home/.commitia/update-check"
+
+  up_commitia -d
+  expect_contains "Cache: 1ª consulta avisa a nova versão" "$LG_OUT" "Nova versão 9.9.9 disponível"
+  expect_contains "Cache: grava a versão remota" "$(cat "$cache" 2>/dev/null)" "remote_version=9.9.9"
+
+  # A origem muda, mas o cache ainda vale: continua avisando a versão pendente sem rede
+  make_commitia_copy "$LG_DIR/remote/bin/commitia" "1.0.0"
+  up_commitia -d
+  expect_contains "Cache: avisa enquanto houver versão pendente (sem nova consulta)" "$LG_OUT" "Nova versão 9.9.9 disponível"
+
+  # Intervalo 0: sempre consulta a rede (a origem já não tem versão nova)
+  up_commitia COMMITIA_UPDATE_CHECK_INTERVAL_HOURS=0 -d
+  expect_not_contains "Cache: intervalo 0 revalida na rede" "$LG_OUT" "Nova versão"
+
+  # Cache vencido: consulta de novo e pega a versão nova da origem
+  make_commitia_copy "$LG_DIR/remote/bin/commitia" "9.9.8"
+  printf 'remote_version=9.9.9\nnext_check=1\n' > "$cache"
+  up_commitia -d
+  expect_contains "Cache: vencido consulta a rede" "$LG_OUT" "Nova versão 9.9.8 disponível"
+  expect_contains "Cache: atualiza o arquivo" "$(cat "$cache")" "remote_version=9.9.8"
+
+  # Intervalo configurável: cache de 2h atrás vale com 24h, mas vence com 1h
+  make_commitia_copy "$LG_DIR/remote/bin/commitia" "9.9.7"
+  printf 'remote_version=9.9.8\nnext_check=%s\n' "$(( $(date +%s) + 3600 ))" > "$cache"
+  up_commitia -d
+  expect_contains "Cache: dentro do prazo mantém a versão em cache" "$LG_OUT" "Nova versão 9.9.8 disponível"
+  printf 'remote_version=9.9.8\nnext_check=%s\n' "$(( $(date +%s) - 10 ))" > "$cache"
+  up_commitia COMMITIA_UPDATE_CHECK_INTERVAL_HOURS=1 -d
+  expect_contains "Cache: após o prazo revalida" "$LG_OUT" "Nova versão 9.9.7 disponível"
+  teardown_update_env
+}
+
+# (A5) Não interativo: só informa e segue (sem perguntar nem atualizar)
+test_update_non_interactive() {
+  large_tests_available || return 0
+  setup_update_env
+  LG_STDIN='s\n' up_commitia COMMITIA_TEST_FORCE_TTY=
+  expect_eq "Não interativo: sai com sucesso" "$LG_RC" "0"
+  expect_contains "Não interativo: informa a nova versão" "$LG_OUT" "Nova versão 9.9.9 disponível"
+  expect_not_contains "Não interativo: não pergunta" "$LG_OUT" "Deseja atualizar"
+  expect_contains "Não interativo: indica como atualizar" "$LG_OUT" "commitia --update"
+  expect_eq "Não interativo: binário intacto" "$(up_installed_version)" "1.0.0"
+  expect_eq "Não interativo: commit aplicado" "$(lg_count)" "2"
+  teardown_update_env
+}
+
+# (A6) Proteção contra loop de reexecução e opção para desligar
+test_update_loop_guard_and_skip() {
+  large_tests_available || return 0
+  setup_update_env
+  LG_STDIN='s\n' up_commitia COMMITIA_UPDATED_REEXEC=1 -d
+  expect_not_contains "Reexecução: não checa de novo (sem loop)" "$LG_OUT" "Nova versão"
+  expect_not_contains "Reexecução: não pergunta" "$LG_OUT" "Deseja atualizar"
+  expect_eq "Reexecução: binário intacto" "$(up_installed_version)" "1.0.0"
+
+  # Origem que só entrega versão antiga mesmo após atualizar: no máximo uma reexecução
+  make_commitia_copy "$LG_DIR/remote/bin/commitia" "1.0.1"
+  make_commitia_copy "$LG_DIR/inst/commitia" "1.0.0"
+  # a "nova" versão continua achando que há uma maior no cache (1.0.1 vs 1.0.1 não é maior)
+  LG_STDIN='s\ns\ns\n' up_commitia
+  expect_eq "Reexecução: uma única pergunta mesmo com várias respostas" "$(printf '%s\n' "$LG_OUT" | grep -c 'Deseja atualizar')" "1"
+  teardown_update_env
+
+  setup_update_env
+  up_commitia COMMITIA_SKIP_UPDATE_CHECK=true -d
+  expect_not_contains "COMMITIA_SKIP_UPDATE_CHECK=true desliga a checagem" "$LG_OUT" "Nova versão"
+  expect_eq "COMMITIA_SKIP_UPDATE_CHECK=true: não cria cache" "$(ls "$LG_DIR/home/.commitia" 2>/dev/null | grep -c update-check || true)" "0"
+  teardown_update_env
+}
+
+# (A7) --dry-run: informa a nova versão sem perguntar nem alterar o binário
+test_update_dry_run() {
+  large_tests_available || return 0
+  setup_update_env
+  LG_STDIN='s\n' up_commitia --dry-run
+  expect_eq "Dry-run: sai com sucesso" "$LG_RC" "0"
+  expect_contains "Dry-run: informa a nova versão" "$LG_OUT" "Nova versão 9.9.9 disponível"
+  expect_contains "Dry-run: explica que não atualiza" "$LG_OUT" "--dry-run"
+  expect_not_contains "Dry-run: não pergunta" "$LG_OUT" "Deseja atualizar"
+  expect_eq "Dry-run: binário intacto" "$(up_installed_version)" "1.0.0"
+  expect_eq "Dry-run: nenhum commit" "$(lg_count)" "1"
+  expect_contains "Dry-run: continua gerando a mensagem" "$LG_OUT" "feat(app): adiciona recurso"
+  teardown_update_env
+}
+
+# (A8) Falha ao atualizar: avisa e segue com a versão atual (sem perder o commit)
+test_update_failure_continues() {
+  large_tests_available || return 0
+  setup_update_env
+  # Cache diz que há versão nova, mas a origem não entrega o arquivo (download falha)
+  mkdir -p "$LG_DIR/home/.commitia"
+  printf 'remote_version=9.9.9\nnext_check=%s\n' "$(( $(date +%s) + 3600 ))" > "$LG_DIR/home/.commitia/update-check"
+  rm -rf "$LG_DIR/remote"
+  LG_STDIN='s\n' up_commitia
+  expect_eq "Falha ao atualizar: sai com sucesso" "$LG_RC" "0"
+  expect_contains "Falha ao atualizar: avisa claramente" "$LG_OUT" "A atualização falhou; seguindo com a versão atual (1.0.0)"
+  expect_eq "Falha ao atualizar: binário intacto" "$(up_installed_version)" "1.0.0"
+  expect_eq "Falha ao atualizar: commit aplicado" "$(lg_count)" "2"
+  teardown_update_env
+
+  # Arquivo remoto inválido (não é um commitia): não instala
+  setup_update_env
+  printf '#!/usr/bin/env bash\nVERSION="9.9.9"\nif then fi fi\n' > "$LG_DIR/remote/bin/commitia"
+  LG_STDIN='s\n' up_commitia
+  expect_contains "Remoto inválido: avisa" "$LG_OUT" "A atualização falhou"
+  expect_eq "Remoto inválido: binário intacto" "$(up_installed_version)" "1.0.0"
+  expect_eq "Remoto inválido: commit aplicado" "$(lg_count)" "2"
+  teardown_update_env
+}
+
+# (A9) Comparação semântica (numérica), não só "diferente"
+test_update_semver() {
+  large_tests_available || return 0
+  setup_update_env 1.0.9 1.0.10
+  up_commitia -d
+  expect_contains "Semver: 1.0.10 > 1.0.9 avisa" "$LG_OUT" "Nova versão 1.0.10 disponível (você está na 1.0.9)"
+  teardown_update_env
+
+  setup_update_env 1.0.10 1.0.9
+  up_commitia -d
+  expect_not_contains "Semver: remota menor não avisa" "$LG_OUT" "Nova versão"
+  teardown_update_env
+
+  setup_update_env 1.0.15 1.0.15
+  LG_STDIN='s\n' up_commitia
+  expect_not_contains "Semver: mesma versão não avisa" "$LG_OUT" "Nova versão"
+  expect_eq "Semver: mesma versão faz o commit normal" "$(lg_count)" "2"
+  teardown_update_env
+
+  setup_update_env 1.9.0 1.10.0
+  up_commitia -d
+  expect_contains "Semver: 1.10.0 > 1.9.0 avisa" "$LG_OUT" "Nova versão 1.10.0 disponível"
+  teardown_update_env
+}
+
+# (A10) --help, --version e --update não disparam a checagem; --update continua funcionando
+test_update_not_on_help_version_update() {
+  large_tests_available || return 0
+  setup_update_env
+  make_fake_curl
+  local out
+  out=$(cd "$LG_REPO" && env HOME="$LG_DIR/home" PATH="$LG_DIR/bin:$PATH" COMMITIA_SKIP_UPDATE_CHECK=false \
+    COMMITIA_TEST_FORCE_TTY=true COMMITIA_REPO_RAW_URL="file://$LG_DIR/remote" \
+    "$LG_DIR/inst/commitia" --version 2>&1 </dev/null)
+  expect_contains "--version funciona" "$out" "CommitIA v1.0.0"
+  out=$(cd "$LG_REPO" && env HOME="$LG_DIR/home" PATH="$LG_DIR/bin:$PATH" COMMITIA_SKIP_UPDATE_CHECK=false \
+    COMMITIA_TEST_FORCE_TTY=true COMMITIA_REPO_RAW_URL="file://$LG_DIR/remote" \
+    "$LG_DIR/inst/commitia" --help 2>&1 </dev/null)
+  expect_contains "--help documenta COMMITIA_SKIP_UPDATE_CHECK" "$out" "COMMITIA_SKIP_UPDATE_CHECK"
+  expect_contains "--help documenta COMMITIA_UPDATE_CHECK_INTERVAL_HOURS" "$out" "COMMITIA_UPDATE_CHECK_INTERVAL_HOURS"
+  expect_not_contains "--version/--help não avisam nova versão" "$out" "Nova versão 9.9.9"
+  expect_eq "--version/--help não consultam a rede" "$(cat "$FAKE_CURL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0"
+  teardown_update_env
+
+  # --update: usa o commitia do PATH, pergunta uma vez (próprio prompt) e reinstala
+  setup_update_env
+  out=$(cd "$LG_REPO" && printf 's' | env HOME="$LG_DIR/home" PATH="$LG_DIR/inst:$PATH" \
+    COMMITIA_REPO_RAW_URL="file://$LG_DIR/remote" COMMITIA_SKIP_UPDATE_CHECK=false \
+    "$LG_DIR/inst/commitia" --update 2>&1 | strip_ansi)
+  expect_contains "--update: informa as versões" "$out" "Versão remota: 9.9.9"
+  expect_contains "--update: atualiza com sucesso" "$out" "Atualizado com sucesso para a versão 9.9.9"
+  expect_eq "--update: binário atualizado" "$(up_installed_version)" "9.9.9"
+  expect_not_contains "--update: não dispara a checagem automática" "$out" "Nova versão"
+  # Já na última versão: informa; --force reinstala
+  out=$(cd "$LG_REPO" && printf 's' | env HOME="$LG_DIR/home" PATH="$LG_DIR/inst:$PATH" \
+    COMMITIA_REPO_RAW_URL="file://$LG_DIR/remote" "$LG_DIR/inst/commitia" --update 2>&1 | strip_ansi)
+  expect_contains "--update: já na versão mais recente" "$out" "Você já está na versão mais recente"
+  out=$(cd "$LG_REPO" && printf 's' | env HOME="$LG_DIR/home" PATH="$LG_DIR/inst:$PATH" \
+    COMMITIA_REPO_RAW_URL="file://$LG_DIR/remote" "$LG_DIR/inst/commitia" --update --force 2>&1 | strip_ansi)
+  expect_contains "--update --force: reinstala" "$out" "Reinstalar a mesma versão 9.9.9"
+  expect_contains "--update --force: conclui" "$out" "Atualizado com sucesso"
+  teardown_update_env
+}
+
+# (A11) Rodando de um clone do repositório (.git ao lado de bin/): não se sobrescreve
+test_update_dev_checkout_not_overwritten() {
+  large_tests_available || return 0
+  setup_update_env
+  mkdir -p "$LG_DIR/clone/bin" "$LG_DIR/clone/.git"
+  make_commitia_copy "$LG_DIR/clone/bin/commitia" "1.0.0"
+  LG_COMMITIA="$LG_DIR/clone/bin/commitia"
+  LG_STDIN='s\n' up_commitia
+  expect_contains "Clone de desenvolvimento: informa a nova versão" "$LG_OUT" "Nova versão 9.9.9 disponível"
+  expect_contains "Clone de desenvolvimento: não se sobrescreve" "$LG_OUT" "clone do repositório"
+  expect_not_contains "Clone de desenvolvimento: não pergunta" "$LG_OUT" "Deseja atualizar"
+  expect_eq "Clone de desenvolvimento: arquivo intacto" "$(grep -m1 '^VERSION=' "$LG_DIR/clone/bin/commitia" | cut -d'"' -f2)" "1.0.0"
+  expect_eq "Clone de desenvolvimento: commit aplicado" "$(lg_count)" "2"
+  teardown_update_env
+}
+
+# (B) CLI desatualizada em terminal interativo: oferece atualizar e continua (ou aborta)
+fake_cli_run() {
+  # $1: provedor; demais: variáveis VAR=valor de ambiente; stdin = $FAKE_STDIN
+  local provider="$1"; shift
+  CASE_OUT=$(cd "$FAKE_DIR/repo" && printf '%b' "${FAKE_STDIN-}" | env PATH="$FAKE_DIR/git:$FAKE_DIR/cli:$PATH" \
+    FAKE_NPM_LOG="$FAKE_NPM_LOG" "$@" "$COMMITIA" --provider "$provider" ${FAKE_ARGS-} 2>&1 | strip_ansi; exit "${PIPESTATUS[1]}") && CASE_RC=0 || CASE_RC=$?
+}
+
+test_cli_update_accept() {
+  setup_fake_env
+  cd "$FAKE_DIR/repo"
+  local provider
+  for provider in cursor copilot claude codex gemini-cli; do
+    cli_case "$provider"
+    fake_help_text "$CASE_BIN" "$CASE_FLAG" > "$FAKE_DIR/cli/$CASE_BIN.help"
+    rm -f "$FAKE_NPM_LOG" "$FAKE_DIR/cli/$CASE_BIN.updated"
+    FAKE_STDIN='s\n' fake_cli_run "$provider" COMMITIA_TEST_FORCE_TTY=true
+    expect_eq "CLI antiga + s ($provider): sai com sucesso" "$CASE_RC" "0"
+    expect_contains "CLI antiga + s ($provider): pergunta se deseja atualizar" "$CASE_OUT" "Deseja atualizar agora?"
+    expect_contains "CLI antiga + s ($provider): executa a atualização" "$CASE_OUT" "Executando: $(echo "$CASE_UPDATE" | sed 's/ *(ou.*//')"
+    if [ "$provider" = "cursor" ]; then
+      expect_eq "CLI antiga + s ($provider): rodou 'update'" "$(cat "$FAKE_DIR/cli/$CASE_BIN.updated" 2>/dev/null)" "update"
+    else
+      expect_eq "CLI antiga + s ($provider): rodou o npm" "$(cat "$FAKE_NPM_LOG" 2>/dev/null)" "$(echo "$CASE_UPDATE" | sed 's/ *(ou.*//; s/^npm //')"
+    fi
+    expect_contains "CLI antiga + s ($provider): revalida e continua" "$CASE_OUT" "atualizada; revalidando"
+    expect_contains "CLI antiga + s ($provider): gera a mensagem" "$CASE_OUT" "feat(app): adiciona novo recurso"
+    expect_not_contains "CLI antiga + s ($provider): não aborta" "$CASE_OUT" "precisa ser atualizada"
+  done
+  cd - > /dev/null
+  rm -rf "$FAKE_DIR"
+}
+
+test_cli_update_decline_and_failures() {
+  setup_fake_env
+  cd "$FAKE_DIR/repo"
+  local provider
+  for provider in cursor claude; do
+    cli_case "$provider"
+    fake_help_text "$CASE_BIN" "$CASE_FLAG" > "$FAKE_DIR/cli/$CASE_BIN.help"
+    rm -f "$FAKE_NPM_LOG" "$FAKE_DIR/cli/$CASE_BIN.updated"
+
+    # "n": aborta com a mensagem de atualização e não roda nada
+    FAKE_STDIN='n\n' fake_cli_run "$provider" COMMITIA_TEST_FORCE_TTY=true
+    expect_eq "CLI antiga + n ($provider): aborta" "$([ "$CASE_RC" -ne 0 ] && echo sim)" "sim"
+    expect_contains "CLI antiga + n ($provider): mensagem de atualização" "$CASE_OUT" "precisa ser atualizada"
+    expect_contains "CLI antiga + n ($provider): comando de atualização" "$CASE_OUT" "$CASE_UPDATE"
+    expect_not_contains "CLI antiga + n ($provider): não gera mensagem" "$CASE_OUT" "Gerando mensagem"
+    expect_eq "CLI antiga + n ($provider): nada foi executado" "$(cat "$FAKE_NPM_LOG" "$FAKE_DIR/cli/$CASE_BIN.updated" 2>/dev/null | wc -l | tr -d ' ')" "0"
+
+    # Atualização falha: aborta com a mensagem
+    FAKE_STDIN='s\n' fake_cli_run "$provider" COMMITIA_TEST_FORCE_TTY=true FAKE_UPDATE_FAIL=1
+    expect_eq "CLI antiga + update falha ($provider): aborta" "$([ "$CASE_RC" -ne 0 ] && echo sim)" "sim"
+    expect_contains "CLI antiga + update falha ($provider): avisa a falha" "$CASE_OUT" "A atualização da CLI '$CASE_BIN' falhou"
+    expect_contains "CLI antiga + update falha ($provider): mensagem de atualização" "$CASE_OUT" "precisa ser atualizada"
+
+    # Atualiza, mas a CLI continua sem a flag: aborta
+    FAKE_STDIN='s\n' fake_cli_run "$provider" COMMITIA_TEST_FORCE_TTY=true FAKE_UPDATE_NOFIX=1
+    expect_eq "CLI antiga + update sem efeito ($provider): aborta" "$([ "$CASE_RC" -ne 0 ] && echo sim)" "sim"
+    expect_contains "CLI antiga + update sem efeito ($provider): avisa" "$CASE_OUT" "ainda não suporta"
+    expect_contains "CLI antiga + update sem efeito ($provider): mensagem de atualização" "$CASE_OUT" "precisa ser atualizada"
+
+    # --dry-run não instala nada: aborta como antes, sem perguntar
+    rm -f "$FAKE_NPM_LOG" "$FAKE_DIR/cli/$CASE_BIN.updated"
+    FAKE_ARGS='-d' FAKE_STDIN='s\n' fake_cli_run "$provider" COMMITIA_TEST_FORCE_TTY=true
+    expect_eq "CLI antiga + dry-run ($provider): aborta" "$([ "$CASE_RC" -ne 0 ] && echo sim)" "sim"
+    expect_not_contains "CLI antiga + dry-run ($provider): não pergunta" "$CASE_OUT" "Deseja atualizar"
+    expect_eq "CLI antiga + dry-run ($provider): nada foi executado" "$(cat "$FAKE_NPM_LOG" "$FAKE_DIR/cli/$CASE_BIN.updated" 2>/dev/null | wc -l | tr -d ' ')" "0"
+
+    # Não interativo: comportamento anterior (aviso e abort, sem perguntar)
+    FAKE_STDIN='s\n' fake_cli_run "$provider"
+    expect_eq "CLI antiga não interativo ($provider): aborta" "$([ "$CASE_RC" -ne 0 ] && echo sim)" "sim"
+    expect_not_contains "CLI antiga não interativo ($provider): não pergunta" "$CASE_OUT" "Deseja atualizar"
+    expect_contains "CLI antiga não interativo ($provider): mensagem de atualização" "$CASE_OUT" "precisa ser atualizada"
+    expect_eq "CLI antiga não interativo ($provider): nada foi executado" "$(cat "$FAKE_NPM_LOG" "$FAKE_DIR/cli/$CASE_BIN.updated" 2>/dev/null | wc -l | tr -d ' ')" "0"
+  done
+  cd - > /dev/null
+  rm -rf "$FAKE_DIR"
+}
+
+# ----------------------------------------------------------------------------
+# Skill para agentes de IA (commitia skill) - hermético: HOME e repo temporários
+# ----------------------------------------------------------------------------
+
+test_skill() {
+  local d out rc orig="$PWD"
+  d=$(mktemp -d)
+  mkdir -p "$d/home" "$d/proj/sub"
+  cd "$d/proj"
+  git init > /dev/null 2>&1 || true
+
+  # Destinos de projeto (executados a partir de uma subpasta: usa a raiz do repo)
+  cd "$d/proj/sub"
+  HOME="$d/home" $COMMITIA skill cursor > /dev/null 2>&1
+  [ -f "$d/proj/.cursor/skills/commitia/SKILL.md" ] && pass "Skill cursor grava em .cursor/skills" || fail "Skill cursor não gravou o arquivo"
+  HOME="$d/home" $COMMITIA skill vscode copilot > /dev/null 2>&1
+  [ -f "$d/proj/.github/skills/commitia/SKILL.md" ] && pass "Skill vscode/copilot grava em .github/skills" || fail "Skill vscode/copilot não gravou o arquivo"
+  HOME="$d/home" $COMMITIA skill claude > /dev/null 2>&1
+  [ -f "$d/proj/.claude/skills/commitia/SKILL.md" ] && pass "Skill claude grava em .claude/skills" || fail "Skill claude não gravou o arquivo"
+
+  # Conteúdo: frontmatter válido e recursos do commitia
+  local f="$d/proj/.cursor/skills/commitia/SKILL.md" content
+  content=$(cat "$f")
+  expect_eq "Skill começa com frontmatter" "$(head -1 "$f")" "---"
+  expect_contains "Skill tem name" "$content" "name: commitia"
+  expect_contains "Skill tem description" "$content" "description:"
+  expect_contains "Skill documenta --no-stage" "$content" "--no-stage"
+  expect_contains "Skill documenta --dry-run" "$content" "--dry-run"
+  expect_contains "Skill documenta arquivos grandes" "$content" "Arquivos grandes"
+  expect_contains "Skill registra a versão" "$content" "commitia v$("$COMMITIA" --version | grep -oE '[0-9][0-9.]*')"
+
+  # Todas as opções do --help principal aparecem na skill
+  local opt missing=""
+  for opt in --message --type --scope --interactive --dry-run --amend --no-stage --provider --lang --update; do
+    printf '%s' "$content" | grep -qF -- "$opt" || missing="$missing $opt"
+  done
+  expect_eq "Skill cobre todas as opções do commitia" "$missing" ""
+
+  # Global usa HOME do usuário
+  HOME="$d/home" $COMMITIA skill cursor copilot claude --global > /dev/null 2>&1
+  [ -f "$d/home/.cursor/skills/commitia/SKILL.md" ] && pass "Skill global cursor em ~/.cursor/skills" || fail "Skill global cursor ausente"
+  [ -f "$d/home/.copilot/skills/commitia/SKILL.md" ] && pass "Skill global copilot em ~/.copilot/skills" || fail "Skill global copilot ausente"
+  [ -f "$d/home/.claude/skills/commitia/SKILL.md" ] && pass "Skill global claude em ~/.claude/skills" || fail "Skill global claude ausente"
+
+  # Idempotência, proteção contra sobrescrita e --force
+  out=$(HOME="$d/home" $COMMITIA skill cursor 2>&1)
+  expect_contains "Skill idêntica: já atualizada" "$out" "já está atualizada"
+  echo "# editada" >> "$f"
+  rc=0; out=$(HOME="$d/home" $COMMITIA skill cursor 2>&1) || rc=$?
+  expect_eq "Skill diferente sem --force: falha" "$rc" "1"
+  expect_contains "Skill diferente sem --force: avisa" "$out" "--force"
+  expect_contains "Skill editada preservada sem --force" "$(cat "$f")" "# editada"
+  HOME="$d/home" $COMMITIA skill cursor --force > /dev/null 2>&1
+  expect_not_contains "--force sobrescreve a skill" "$(cat "$f")" "# editada"
+
+  # Destino 'file': stdout, caminho padrão e caminho customizado
+  out=$(HOME="$d/home" $COMMITIA skill file -o - 2>&1)
+  expect_eq "file -o - imprime a skill" "$(printf '%s\n' "$out" | head -1)" "---"
+  cd "$d"
+  HOME="$d/home" $COMMITIA skill file > /dev/null 2>&1
+  [ -f "$d/commitia-skill.md" ] && pass "file grava ./commitia-skill.md por padrão" || fail "file não gravou o arquivo padrão"
+  HOME="$d/home" $COMMITIA skill file -o "$d/out/dir/SKILL.md" > /dev/null 2>&1
+  [ -f "$d/out/dir/SKILL.md" ] && pass "file -o cria diretórios e grava no caminho" || fail "file -o não gravou"
+
+  # Dry-run não cria arquivos
+  HOME="$d/home" $COMMITIA skill file -o "$d/dry/SKILL.md" --dry-run > /dev/null 2>&1
+  [ ! -e "$d/dry" ] && pass "skill --dry-run não cria arquivos" || fail "skill --dry-run criou arquivos"
+
+  # Erros: destino inválido, opção inválida e sem destino fora de terminal
+  out=$(HOME="$d/home" $COMMITIA skill vim 2>&1 || true)
+  expect_contains "Destino inválido é rejeitado" "$out" "Destino desconhecido"
+  out=$(HOME="$d/home" $COMMITIA skill cursor --xyz 2>&1 || true)
+  expect_contains "Opção inválida em skill é rejeitada" "$out" "Opção desconhecida para 'skill'"
+  rc=0; out=$(HOME="$d/home" $COMMITIA skill < /dev/null 2>&1) || rc=$?
+  expect_eq "Sem destino e sem terminal: falha" "$rc" "1"
+  expect_contains "Sem destino e sem terminal: orienta o uso" "$out" "informe o destino"
+
+  # Menu interativo (terminal simulado): 3 = Copilot, 2 = global
+  HOME="$d/home2" COMMITIA_TEST_FORCE_TTY=true bash -c "printf '3\n2\n' | $COMMITIA skill" > /dev/null 2>&1
+  [ -f "$d/home2/.copilot/skills/commitia/SKILL.md" ] && pass "Menu interativo instala a skill escolhida" || fail "Menu interativo não instalou a skill"
+
+  # Help
+  expect_contains "skill --help lista os destinos" "$($COMMITIA skill --help)" "copilot"
+  expect_contains "Help principal menciona a skill" "$($COMMITIA --help)" "skill"
+
+  cd "$orig"
+  rm -rf "$d"
+}
+
+# ----------------------------------------------------------------------------
+# .commitiaignore (hermético: git real em repositórios temporários + CLI falsa)
+#
+#   +arquivo  -> commitado normalmente, mas o diff NÃO vai para a IA
+#   arquivo   -> NÃO é adicionado automaticamente; entra só se já estiver staged
+# ----------------------------------------------------------------------------
+
+# Cria o harness de parsing/matching: extrai do bin/commitia as funções do módulo
+# (o script chama main ao final, então não pode ser carregado com 'source').
+setup_ignore_harness() {
+  IG_HARNESS=$(mktemp)
+  {
+    echo 'warn() { echo "WARN: $*" >&2; }'
+    echo 'info() { :; }'
+    echo 'IGNORE_FILE_NAME=".commitiaignore"'
+    local fn
+    for fn in ignore_glob_to_regex parse_ignore_file ignore_match_any is_manual_only_path is_ai_excluded_path; do
+      awk -v n="$fn" '$0 ~ "^" n "\\(\\) \\{" {p=1} p {print} p && /^\}/ {p=0}' "$COMMITIA"
+    done
+  } > "$IG_HARNESS"
+}
+
+# Conteúdo do .commitiaignore ($1), tipo de regra ($2: manual|noai), caminho ($3) -> yes|no
+ig_match() {
+  local f result
+  f=$(mktemp)
+  printf '%b' "$1" > "$f"
+  result=$(bash -c '
+    source "$1"
+    parse_ignore_file "$2"
+    case "$3" in
+      manual) is_manual_only_path "$4" ;;
+      noai) is_ai_excluded_path "$4" ;;
+    esac && echo yes || echo no' _ "$IG_HARNESS" "$f" "$2" "$3" 2>/dev/null)
+  rm -f "$f"
+  echo "$result"
+}
+
+# Quantidade de regras lidas: "<manual> <noai>"
+ig_counts() {
+  local f result
+  f=$(mktemp)
+  printf '%b' "$1" > "$f"
+  result=$(bash -c '
+    source "$1"
+    parse_ignore_file "$2"
+    echo "${#IGNORE_MANUAL_RES[@]} ${#IGNORE_NOAI_RES[@]}"' _ "$IG_HARNESS" "$f" 2>/dev/null)
+  rm -f "$f"
+  echo "$result"
+}
+
+test_ignore_parsing() {
+  setup_ignore_harness
+
+  expect_eq "Parsing: comentários e linhas vazias são ignorados" \
+    "$(ig_counts '# comentário\n\n   \n  # outro\nfoo.txt\n')" "1 0"
+  expect_eq "Parsing: '+' conta como regra de IA, sem prefixo como regra manual" \
+    "$(ig_counts 'a.txt\n+b.txt\n# c\n+d/**\ne/\n')" "2 2"
+  expect_eq "Parsing: espaços e CRLF são tolerados" \
+    "$(ig_counts '  a.txt  \r\n+ b.txt\r\n\r\n')" "1 1"
+  expect_eq "Parsing: arquivo vazio não tem regras" "$(ig_counts '')" "0 0"
+  expect_eq "Parsing: última linha sem quebra de linha é lida" "$(ig_counts 'a.txt\n+b.txt')" "1 1"
+  expect_eq "Parsing: negação (!) é ignorada" "$(ig_counts '!a.txt\nb.txt\n')" "1 0"
+  expect_eq "Parsing: '+' sozinho é ignorado" "$(ig_counts '+\n+   \nb.txt\n')" "1 0"
+  expect_eq "Parsing: '+' com espaço depois: padrão correto" \
+    "$(ig_match '+ package-lock.json\n' noai package-lock.json)" "yes"
+  expect_eq "Parsing: entrada '+' não vira regra manual" \
+    "$(ig_match '+package-lock.json\n' manual package-lock.json)" "no"
+  expect_eq "Parsing: entrada sem prefixo não vira regra de IA" \
+    "$(ig_match 'package-lock.json\n' noai package-lock.json)" "no"
+  expect_eq "Parsing: comentário não casa como padrão" "$(ig_match '# a.txt\n' manual '# a.txt')" "no"
+  expect_eq "Parsing: '#' escapado vira padrão literal" "$(ig_match '\\#hash.txt\n' manual '#hash.txt')" "yes"
+  expect_eq "Parsing: '+' escapado vira padrão sem prefixo" "$(ig_match '\\+mais.txt\n' manual '+mais.txt')" "yes"
+
+  # Globs (mesmo resultado para as duas semânticas; usa 'manual')
+  expect_eq "Glob: nome sem barra casa na raiz" "$(ig_match 'nome.txt\n' manual nome.txt)" "yes"
+  expect_eq "Glob: nome sem barra casa em qualquer pasta" "$(ig_match 'nome.txt\n' manual a/b/nome.txt)" "yes"
+  expect_eq "Glob: nome diferente não casa" "$(ig_match 'nome.txt\n' manual outro.txt)" "no"
+  expect_eq "Glob: nome não casa por sufixo" "$(ig_match 'nome.txt\n' manual xnome.txt)" "no"
+  expect_eq "Glob: *.lock casa na raiz" "$(ig_match '*.lock\n' manual yarn.lock)" "yes"
+  expect_eq "Glob: *.lock casa em subpasta" "$(ig_match '*.lock\n' manual app/Cargo.lock)" "yes"
+  expect_eq "Glob: *.lock não casa .locked" "$(ig_match '*.lock\n' manual a.locked)" "no"
+  expect_eq "Glob: dir/** casa arquivos e subpastas" "$(ig_match 'dir/**\n' manual dir/a/b.txt)" "yes"
+  expect_eq "Glob: dir/** casa filho direto" "$(ig_match 'dir/**\n' manual dir/a.txt)" "yes"
+  expect_eq "Glob: dir/** é ancorado na raiz" "$(ig_match 'dir/**\n' manual outro/dir/a.txt)" "no"
+  expect_eq "Glob: dir/** não casa pasta homônima parcial" "$(ig_match 'dir/**\n' manual dir2/a.txt)" "no"
+  expect_eq "Glob: pasta com barra final casa o conteúdo" "$(ig_match 'build/\n' manual build/out.o)" "yes"
+  expect_eq "Glob: pasta com barra final casa em qualquer nível" "$(ig_match 'build/\n' manual src/build/out.o)" "yes"
+  expect_eq "Glob: pasta com barra final não casa arquivo homônimo" "$(ig_match 'build/\n' manual build)" "no"
+  expect_eq "Glob: nome sem barra casa o conteúdo de uma pasta homônima" "$(ig_match 'tmp\n' manual tmp/a.txt)" "yes"
+  expect_eq "Glob: barra no meio ancora na raiz" "$(ig_match 'docs/*.md\n' manual docs/a.md)" "yes"
+  expect_eq "Glob: barra no meio não casa em outra pasta" "$(ig_match 'docs/*.md\n' manual x/docs/a.md)" "no"
+  expect_eq "Glob: * não atravessa pastas" "$(ig_match 'docs/*.md\n' manual docs/sub/a.md)" "no"
+  expect_eq "Glob: barra inicial ancora na raiz" "$(ig_match '/raiz.txt\n' manual raiz.txt)" "yes"
+  expect_eq "Glob: barra inicial não casa em subpasta" "$(ig_match '/raiz.txt\n' manual sub/raiz.txt)" "no"
+  expect_eq "Glob: **/ casa na raiz" "$(ig_match '**/gen/*.js\n' manual gen/a.js)" "yes"
+  expect_eq "Glob: **/ casa em profundidade" "$(ig_match '**/gen/*.js\n' manual a/b/gen/a.js)" "yes"
+  expect_eq "Glob: **/ respeita o restante do padrão" "$(ig_match '**/gen/*.js\n' manual a/gen/b/c.js)" "no"
+  expect_eq "Glob: a/**/b casa zero pastas" "$(ig_match 'a/**/b\n' manual a/b)" "yes"
+  expect_eq "Glob: a/**/b casa várias pastas" "$(ig_match 'a/**/b\n' manual a/x/y/b)" "yes"
+  expect_eq "Glob: ? casa um caractere" "$(ig_match 'f?.txt\n' manual f1.txt)" "yes"
+  expect_eq "Glob: ? não casa zero caracteres" "$(ig_match 'f?.txt\n' manual f.txt)" "no"
+  expect_eq "Glob: ? não casa a barra" "$(ig_match 'f?g\n' manual f/g)" "no"
+  expect_eq "Glob: classe [ab]" "$(ig_match '[ab].txt\n' manual b.txt)" "yes"
+  expect_eq "Glob: classe [ab] não casa c" "$(ig_match '[ab].txt\n' manual c.txt)" "no"
+  expect_eq "Glob: classe negada [!a]" "$(ig_match '[!a].txt\n' manual b.txt)" "yes"
+  expect_eq "Glob: classe negada [!a] não casa a" "$(ig_match '[!a].txt\n' manual a.txt)" "no"
+  expect_eq "Glob: ponto é literal" "$(ig_match 'a.b\n' manual axb)" "no"
+  expect_eq "Glob: caracteres especiais de regex são literais" "$(ig_match 'a+b(1).txt\n' manual 'a+b(1).txt')" "yes"
+  expect_eq "Glob: espaço no nome" "$(ig_match 'meu arquivo.txt\n' manual 'meu arquivo.txt')" "yes"
+  expect_eq "Glob: a mesma sintaxe vale para '+'" "$(ig_match '+dist/**\n' noai dist/app.js)" "yes"
+  expect_eq "Glob: '+' com *.lock em subpasta" "$(ig_match '+*.lock\n' noai web/yarn.lock)" "yes"
+
+  rm -f "$IG_HARNESS"
+}
+
+# Cria o .commitiaignore e o commita (baseline: 2 commits no repositório)
+ig_setup() {
+  printf '%b' "$1" > "$LG_REPO/.commitiaignore"
+  lg_git add .commitiaignore
+  lg_git commit -q -m "chore: add commitiaignore"
+}
+
+ig_subject() { lg_git log -1 --format=%s; }
+
+test_ignore_absent_file() {
+  large_tests_available || return 0
+  setup_large_env
+  echo 'echo a' > "$LG_REPO/app.sh"
+  lg_commitia
+  expect_eq "Sem .commitiaignore: commit normal" "$(lg_count)" "2"
+  expect_eq "Sem .commitiaignore: sem erro" "$LG_RC" "0"
+  expect_not_contains "Sem .commitiaignore: não menciona o arquivo" "$LG_OUT" ".commitiaignore"
+  teardown_large_env
+}
+
+test_ignore_plus_committed_but_not_sent_to_ai() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup '# lockfile vai no commit, fora da IA\n+package-lock.json\n'
+  echo 'echo a' > "$LG_REPO/app.sh"
+  echo 'CONTEUDO-SECRETO-DO-LOCK' > "$LG_REPO/package-lock.json"
+  lg_commitia
+  expect_eq "'+': um único commit" "$(lg_count)" "3"
+  expect_eq "'+': arquivo '+' entra no commit junto com os demais" "$(lg_files 0)" "app.sh package-lock.json"
+  expect_eq "'+': working tree limpa" "$(lg_git status --porcelain)" ""
+  expect_eq "'+': IA chamada uma vez" "$(lg_nprompts)" "1"
+  expect_contains "'+': IA recebe o diff dos demais arquivos" "$(lg_prompt 1)" "echo a"
+  expect_not_contains "'+': conteúdo do arquivo '+' NÃO vai à IA" "$(lg_prompt 1)" "CONTEUDO-SECRETO-DO-LOCK"
+  expect_not_contains "'+': diff do arquivo '+' NÃO vai à IA" "$(lg_prompt 1)" "diff --git a/package-lock.json"
+  expect_contains "'+': IA é avisada do arquivo omitido (só o nome)" "$(lg_prompt 1)" "package-lock.json"
+  expect_contains "'+': mensagem informa que o arquivo não vai à IA" "$LG_OUT" "conteúdo não enviado à IA"
+  teardown_large_env
+}
+
+test_ignore_plus_glob_and_dir() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup '+*.lock\n+generated/**\n'
+  mkdir -p "$LG_REPO/generated/deep" "$LG_REPO/web"
+  echo 'echo a' > "$LG_REPO/app.sh"
+  echo 'SEGREDO-LOCK' > "$LG_REPO/web/yarn.lock"
+  echo 'SEGREDO-GERADO' > "$LG_REPO/generated/deep/out.js"
+  lg_commitia
+  expect_eq "'+' com globs: um commit com tudo" "$(lg_files 0)" "app.sh generated/deep/out.js web/yarn.lock"
+  expect_not_contains "'+' com glob *.lock: fora da IA" "$(lg_prompt 1)" "SEGREDO-LOCK"
+  expect_not_contains "'+' com dir/**: fora da IA" "$(lg_prompt 1)" "SEGREDO-GERADO"
+  expect_contains "'+' com globs: demais arquivos vão à IA" "$(lg_prompt 1)" "echo a"
+  teardown_large_env
+}
+
+test_ignore_plus_only_files() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup '+package-lock.json\n'
+  echo 'SEGREDO-LOCK' > "$LG_REPO/package-lock.json"
+  lg_commitia
+  expect_eq "Só arquivos '+': commit criado" "$(lg_count)" "3"
+  expect_eq "Só arquivos '+': commit com o arquivo" "$(lg_files 0)" "package-lock.json"
+  expect_eq "Só arquivos '+': IA não é chamada" "$(lg_nprompts)" "0"
+  expect_eq "Só arquivos '+': mensagem padrão sem IA" "$(ig_subject)" "chore(deps): atualiza package-lock.json"
+  expect_contains "Só arquivos '+': avisa que nada vai à IA" "$LG_OUT" "nada é enviado à IA"
+  teardown_large_env
+}
+
+test_ignore_plus_large_file_not_split() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup '+yarn.lock\n'
+  echo 'echo a' > "$LG_REPO/app.sh"
+  lg_make_lock yarn.lock 30
+  lg_make_lock package-lock.json 30
+  lg_commitia
+  expect_eq "'+' grande: 2 commits novos (só o outro lockfile é separado)" "$(lg_count)" "4"
+  expect_eq "'+' grande: arquivo '+' fica no commit dos pequenos" "$(lg_files 1)" "app.sh yarn.lock"
+  expect_eq "'+' grande: lockfile sem '+' continua em commit próprio" "$(lg_files 0)" "package-lock.json"
+  expect_not_contains "'+' grande: conteúdo do '+' fora da IA (commit dos pequenos)" "$(lg_prompt 1)" "pacote1: 1.0.1"
+  expect_contains "'+' grande: lockfile sem '+' é enviado normalmente" "$(lg_prompt 2)" "pacote1: 1.0.1"
+  teardown_large_env
+}
+
+test_ignore_plus_large_fallback_summary_omits_content() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup '+yarn.lock\n'
+  echo 'echo a' > "$LG_REPO/app.sh"
+  local i
+  for i in $(seq 1 30); do echo "YARN-SEGREDO-$i"; done > "$LG_REPO/yarn.lock"
+  lg_make_lock package-lock.json 30
+  # IA falha para o diff completo do lockfile; o fallback resumido não pode vazar o '+'
+  lg_commitia FAKE_FAIL_MATCH='Diff:' FAKE_FAIL_MATCH2='package-lock'
+  expect_eq "Fallback com '+': commits criados" "$(lg_count)" "4"
+  local all_prompts
+  all_prompts=$(cat "$LG_DIR"/out/prompt-*.txt)
+  expect_contains "Fallback com '+': o outro lockfile segue o fluxo normal" "$all_prompts" "package-lock.json"
+  expect_not_contains "Fallback com '+': nenhum prompt contém o conteúdo do '+'" "$all_prompts" "YARN-SEGREDO"
+  teardown_large_env
+}
+
+test_ignore_plain_not_auto_added() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup '# não commitar sozinho\n.env.local\n'
+  echo 'echo a' > "$LG_REPO/app.sh"
+  echo 'SEGREDO-ENV' > "$LG_REPO/.env.local"
+  lg_commitia
+  expect_eq "Sem prefixo: um commit" "$(lg_count)" "3"
+  expect_eq "Sem prefixo: arquivo não vai no commit" "$(lg_files 0)" "app.sh"
+  expect_eq "Sem prefixo: continua não rastreado" "$(lg_git status --porcelain)" "?? .env.local"
+  expect_eq "Sem prefixo: nunca vai à IA (nem foi staged)" "$(lg_prompt 1 | grep -c SEGREDO-ENV || true)" "0"
+  expect_contains "Sem prefixo: informa o arquivo não adicionado" "$LG_OUT" "Não adicionados automaticamente"
+  expect_contains "Sem prefixo: lista o arquivo" "$LG_OUT" ".env.local"
+  teardown_large_env
+}
+
+test_ignore_plain_tracked_modified_not_added() {
+  large_tests_available || return 0
+  setup_large_env
+  echo 'v1' > "$LG_REPO/config.local"
+  lg_git add config.local
+  lg_git commit -q -m "chore: add config"
+  ig_setup 'config.local\n'
+  echo 'v2' > "$LG_REPO/config.local"
+  echo 'echo a' > "$LG_REPO/app.sh"
+  lg_commitia
+  expect_eq "Sem prefixo (rastreado): só o outro arquivo no commit" "$(lg_files 0)" "app.sh"
+  expect_eq "Sem prefixo (rastreado): modificação continua fora do stage" "$(lg_git status --porcelain)" " M config.local"
+  teardown_large_env
+}
+
+test_ignore_plain_deleted_not_added() {
+  large_tests_available || return 0
+  setup_large_env
+  echo 'x' > "$LG_REPO/velho.local"
+  lg_git add velho.local
+  lg_git commit -q -m "chore: add velho"
+  ig_setup 'velho.local\n'
+  rm "$LG_REPO/velho.local"
+  echo 'echo a' > "$LG_REPO/app.sh"
+  lg_commitia
+  expect_eq "Sem prefixo (removido): remoção não é commitada sozinha" "$(lg_files 0)" "app.sh"
+  expect_eq "Sem prefixo (removido): remoção continua pendente" "$(lg_git status --porcelain)" " D velho.local"
+  teardown_large_env
+}
+
+test_ignore_plain_only_changes_errors() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup '.env.local\n'
+  echo 'SEGREDO-ENV' > "$LG_REPO/.env.local"
+  lg_commitia
+  expect_eq "Só arquivos sem prefixo: nenhum commit" "$(lg_count)" "2"
+  expect_eq "Só arquivos sem prefixo: erro" "$LG_RC" "1"
+  expect_contains "Só arquivos sem prefixo: explica o motivo" "$LG_OUT" "estão no .commitiaignore"
+  expect_eq "Só arquivos sem prefixo: nada foi staged" "$(lg_staged)" ""
+  expect_eq "Só arquivos sem prefixo: IA não chamada" "$(lg_nprompts)" "0"
+  teardown_large_env
+}
+
+test_ignore_plain_manually_staged_is_committed() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup '.env.local\n'
+  echo 'echo a' > "$LG_REPO/app.sh"
+  echo 'SEGREDO-ENV' > "$LG_REPO/.env.local"
+  lg_git add .env.local
+  lg_commitia
+  expect_eq "Staged manual sem prefixo: entra no commit" "$(lg_files 0)" ".env.local"
+  expect_eq "Staged manual sem prefixo: não removido do stage antes do commit (commit criado)" "$(lg_count)" "3"
+  expect_contains "Staged manual sem prefixo: conteúdo vai à IA (escolha explícita)" "$(lg_prompt 1)" "SEGREDO-ENV"
+  expect_eq "Staged manual sem prefixo: demais arquivos seguem o fluxo padrão (não adicionados)" "$(lg_git status --porcelain)" "?? app.sh"
+  teardown_large_env
+}
+
+test_ignore_plain_manually_staged_with_file_arg() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup '*.key\n'
+  mkdir -p "$LG_REPO/src"
+  echo 'echo a' > "$LG_REPO/src/a.sh"
+  echo 'CHAVE-V1' > "$LG_REPO/src/dev.key"
+  lg_git add src/dev.key
+  echo 'CHAVE-V2' > "$LG_REPO/src/dev.key"   # alteração posterior, fora do stage
+  lg_commitia src/
+  expect_eq "Staged manual + diretório: stage manual e novos arquivos entram" "$(lg_files 0)" "src/a.sh src/dev.key"
+  expect_eq "Staged manual + diretório: versão staged é preservada (não re-adicionada)" "$(lg_git show HEAD:src/dev.key)" "CHAVE-V1"
+  expect_eq "Staged manual + diretório: alteração posterior continua pendente" "$(lg_git status --porcelain)" " M src/dev.key"
+  teardown_large_env
+}
+
+test_ignore_plain_dir_arg_skips_ignored() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup '*.key\nsrc/private/**\n'
+  mkdir -p "$LG_REPO/src/private" "$LG_REPO/other"
+  echo 'echo a' > "$LG_REPO/src/a.sh"
+  echo 'K' > "$LG_REPO/src/dev.key"
+  echo 'P' > "$LG_REPO/src/private/p.txt"
+  echo 'o' > "$LG_REPO/other/o.sh"
+  lg_commitia src/
+  expect_eq "Diretório como argumento: só o que não está no .commitiaignore" "$(lg_files 0)" "src/a.sh"
+  expect_contains "Diretório como argumento: informa o ignorado" "$LG_OUT" "src/dev.key"
+  expect_contains "Diretório como argumento: informa o ignorado (dir/**)" "$LG_OUT" "src/private/p.txt"
+  expect_contains "Diretório como argumento: fora do diretório continua intocado" "$(lg_git status --porcelain)" "other/"
+  teardown_large_env
+}
+
+test_ignore_plain_explicit_file_arg_is_added() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup '.env.local\n'
+  echo 'SEGREDO-ENV' > "$LG_REPO/.env.local"
+  lg_commitia .env.local
+  expect_eq "Arquivo explícito como argumento: equivale a git add manual" "$(lg_files 0)" ".env.local"
+  expect_contains "Arquivo explícito como argumento: conteúdo vai à IA" "$(lg_prompt 1)" "SEGREDO-ENV"
+  teardown_large_env
+}
+
+test_ignore_plain_no_stage_option() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup '.env.local\n'
+  echo 'SEGREDO-ENV' > "$LG_REPO/.env.local"
+  lg_git add .env.local
+  lg_commitia --no-stage
+  expect_eq "--no-stage: staged manual sem prefixo é commitado" "$(lg_files 0)" ".env.local"
+  teardown_large_env
+}
+
+test_ignore_precedence_both_rules() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup 'secret.dat\n+secret.dat\n'
+  echo 'echo a' > "$LG_REPO/app.sh"
+  echo 'SEGREDO-DAT' > "$LG_REPO/secret.dat"
+  lg_commitia
+  expect_eq "Precedência (ambas): não é adicionado automaticamente" "$(lg_files 0)" "app.sh"
+  expect_eq "Precedência (ambas): continua fora do commit" "$(lg_git status --porcelain)" "?? secret.dat"
+
+  # Staged manualmente: entra no commit, mas o conteúdo continua fora da IA ('+' vence no eixo IA)
+  echo 'echo b' >> "$LG_REPO/app.sh"
+  lg_git add secret.dat app.sh
+  lg_commitia
+  expect_eq "Precedência (ambas), staged manual: vai no commit" "$(lg_files 0)" "app.sh secret.dat"
+  expect_not_contains "Precedência (ambas), staged manual: conteúdo fora da IA" "$(cat "$LG_DIR"/out/prompt-*.txt)" "SEGREDO-DAT"
+  teardown_large_env
+}
+
+test_ignore_precedence_ai_only_when_staged() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup '.env.local\n+*.lock\n'
+  echo 'SEGREDO-ENV' > "$LG_REPO/.env.local"
+  echo 'SEGREDO-LOCK' > "$LG_REPO/a.lock"
+  echo 'echo a' > "$LG_REPO/app.sh"
+  lg_commitia
+  expect_eq "Regras distintas: '+' commitado, sem prefixo não" "$(lg_files 0)" "a.lock app.sh"
+  expect_eq "Regras distintas: sem prefixo fica de fora" "$(lg_git status --porcelain)" "?? .env.local"
+  expect_not_contains "Regras distintas: '+' fora da IA" "$(lg_prompt 1)" "SEGREDO-LOCK"
+  teardown_large_env
+}
+
+test_ignore_dry_run_keeps_rules() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup '+package-lock.json\n.env.local\n'
+  echo 'echo a' > "$LG_REPO/app.sh"
+  echo 'SEGREDO-LOCK' > "$LG_REPO/package-lock.json"
+  echo 'SEGREDO-ENV' > "$LG_REPO/.env.local"
+  lg_commitia -d
+  expect_eq "Dry-run: nenhum commit" "$(lg_count)" "2"
+  expect_eq "Dry-run: '+' staged, sem prefixo não" "$(lg_staged)" "app.sh package-lock.json"
+  expect_not_contains "Dry-run: '+' fora da IA" "$(lg_prompt 1)" "SEGREDO-LOCK"
+  expect_not_contains "Dry-run: sem prefixo fora da IA" "$(lg_prompt 1)" "SEGREDO-ENV"
+  teardown_large_env
+}
+
+test_ignore_comments_and_blank_lines_integration() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup '# comentário\n\n   \n+package-lock.json   \n\n# fim\n'
+  echo 'echo a' > "$LG_REPO/app.sh"
+  echo 'SEGREDO-LOCK' > "$LG_REPO/package-lock.json"
+  lg_commitia
+  expect_contains "Comentários/linhas vazias: 1 regra lida" "$LG_OUT" "1 regra(s)"
+  expect_not_contains "Comentários/linhas vazias: '+' funciona" "$(lg_prompt 1)" "SEGREDO-LOCK"
+  teardown_large_env
+}
+
+test_ignore_negation_warns() {
+  large_tests_available || return 0
+  setup_large_env
+  ig_setup '!a.txt\n'
+  echo 'echo a' > "$LG_REPO/app.sh"
+  lg_commitia
+  expect_contains "Negação: avisa que não é suportada" "$LG_OUT" "negação"
+  expect_eq "Negação: não impede o commit" "$(lg_files 0)" "app.sh"
+  teardown_large_env
+}
+
+test_ignore_help_documents_file() {
+  if $COMMITIA --help | grep -q "COMMITIAIGNORE" && $COMMITIA --help | grep -q "DIFERENTE da do .gitignore"; then
+    pass "Help documenta o .commitiaignore"
+  else
+    fail "Help não documenta o .commitiaignore"
+  fi
+}
+
+# ----------------------------------------------------------------------------
 # Execução
 # ----------------------------------------------------------------------------
 
@@ -849,6 +1784,7 @@ test_version
 test_invalid_option
 test_not_git_repo
 test_dry_run
+test_skill
 test_unknown_provider
 test_cli_provider_missing_binary
 test_cli_provider_generates_message
@@ -857,6 +1793,19 @@ test_cli_outdated_runtime
 test_cli_up_to_date
 test_cli_outdated_large_files_first_attempt
 test_cli_outdated_large_files_summary_fallback
+test_cli_update_accept
+test_cli_update_decline_and_failures
+test_update_accept
+test_update_decline
+test_update_offline
+test_update_cache
+test_update_non_interactive
+test_update_loop_guard_and_skip
+test_update_dry_run
+test_update_failure_continues
+test_update_semver
+test_update_not_on_help_version_update
+test_update_dev_checkout_not_overwritten
 test_large_none
 test_large_split_lockfile
 test_large_only_lockfiles
@@ -876,6 +1825,28 @@ test_large_files_argument
 test_large_interactive
 test_large_special_names_and_deletion
 test_large_unborn_repo
+test_ignore_parsing
+test_ignore_absent_file
+test_ignore_plus_committed_but_not_sent_to_ai
+test_ignore_plus_glob_and_dir
+test_ignore_plus_only_files
+test_ignore_plus_large_file_not_split
+test_ignore_plus_large_fallback_summary_omits_content
+test_ignore_plain_not_auto_added
+test_ignore_plain_tracked_modified_not_added
+test_ignore_plain_deleted_not_added
+test_ignore_plain_only_changes_errors
+test_ignore_plain_manually_staged_is_committed
+test_ignore_plain_manually_staged_with_file_arg
+test_ignore_plain_dir_arg_skips_ignored
+test_ignore_plain_explicit_file_arg_is_added
+test_ignore_plain_no_stage_option
+test_ignore_precedence_both_rules
+test_ignore_precedence_ai_only_when_staged
+test_ignore_dry_run_keeps_rules
+test_ignore_comments_and_blank_lines_integration
+test_ignore_negation_warns
+test_ignore_help_documents_file
 
 echo ""
 echo "====================================="

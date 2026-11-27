@@ -159,9 +159,35 @@ cp ~/.commitiarc.example ~/.commitiarc
 nano ~/.commitiarc
 ```
 
+### `.commitiaignore` (opcional, por projeto)
+
+Na raiz de um repositório, um `.commitiaignore` controla o que o commitia adiciona sozinho e o que envia à IA. **A semântica é diferente da do `.gitignore`**:
+
+- `+package-lock.json` → o arquivo **é commitado**, mas o diff **não vai para a IA**;
+- `.env.local` (sem prefixo) → **não é adicionado automaticamente**; só entra no commit se você já fez `git add` antes.
+
+Veja [COMMITIAIGNORE.md](COMMITIAIGNORE.md) e o modelo [`.commitiaignore.example`](../.commitiaignore.example).
+
 ## Atualização
 
-Para atualizar para a versão mais recente:
+### Automática (ao commitar)
+
+Antes de gerar o commit, o commitia consulta (no máximo 1x por dia, timeout de 3s, silencioso offline) se há versão mais nova. Em terminal interativo ele pergunta `Deseja atualizar agora? [S/n]`; se sim, atualiza e continua o commit com a versão nova. Sem terminal interativo (pipe/CI) ou com `--dry-run`, só informa. Não roda com `--help`, `--version` e `--update`.
+
+| Variável                               | Padrão  | Descrição                                              |
+| -------------------------------------- | ------- | ------------------------------------------------------ |
+| `COMMITIA_SKIP_UPDATE_CHECK`           | `false` | `true` desliga a checagem de nova versão               |
+| `COMMITIA_UPDATE_CHECK_INTERVAL_HOURS` | `24`    | Intervalo mínimo entre consultas à rede (`0` = sempre) |
+
+O cache da consulta fica em `~/.commitia/update-check`.
+
+### Manual
+
+```bash
+commitia --update
+```
+
+Ou, a partir do clone do repositório:
 
 ```bash
 cd /path/to/commitia
@@ -232,6 +258,8 @@ O commitia confere, antes de gerar a mensagem, se a CLI instalada lista no `--he
 | `gemini-cli` | `--approval-mode`, `--skip-trust`, `--prompt`             | `npm install -g @google/gemini-cli@latest`                              |
 
 A lista completa de flags por CLI está no [README](../README.md#versões-e-capacidades-exigidas-das-clis). Não há versão mínima fixa: a validação é por capacidade. O mesmo aviso aparece se a CLI responder `unknown option` em tempo de execução.
+
+Em terminal interativo, o commitia oferece rodar esse comando para você (`Deseja atualizar agora? [S/n]`) e, se der certo, continua o commit. Sem terminal interativo ou com `--dry-run`, apenas avisa e aborta.
 
 Para pular a validação preventiva: `export COMMITIA_SKIP_CLI_VERSION_CHECK=true` (ou no `.commitiarc`).
 

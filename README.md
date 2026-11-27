@@ -15,6 +15,8 @@ CommitIA analisa suas alterações no Git e gera automaticamente mensagens de co
 - 🌍 **Multi-idioma** - Suporte para português, inglês e espanhol
 - 🤖 **Múltiplos provedores de IA** - Compatível com amp CLI, OpenAI, Gemini, Ollama e as CLIs do Cursor, GitHub Copilot, Claude Code, Codex e Gemini
 - 📦 **Arquivos grandes sem dor de cabeça** - Lockfiles (`pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`...) e diffs enormes são commitados separadamente, com fallback automático quando a IA falha
+- 🙈 **`.commitiaignore`** - Controle o que o commitia adiciona sozinho e o que ele envia à IA (semântica própria, **diferente do `.gitignore`**; veja [a seção abaixo](#-commitiaignore-controle-o-que-é-commitado-e-o-que-vai-para-a-ia))
+- 🧠 **Skill para agentes de IA** - `commitia skill` ensina Cursor, VS Code/Copilot e Claude Code a usar o commitia nos commits
 - 🎨 **Interface amigável** - Cores, feedback claro e modo interativo
 - ⚡ **Rápido e leve** - Script bash sem dependências pesadas
 
@@ -93,6 +95,8 @@ commitia -a
 | `--no-stage`            | Não adiciona arquivos automaticamente |
 | `--provider <provider>` | Define o provedor de IA               |
 | `--lang <idioma>`       | Idioma da mensagem (pt, en, es)       |
+| `--update`              | Atualiza para a versão mais recente   |
+| `--force`               | Reinstala mesmo na versão atual (com `--update`) |
 | `-v, --version`         | Mostra a versão                       |
 | `-h, --help`            | Mostra ajuda                          |
 
@@ -158,6 +162,29 @@ export COMMITIA_PROVIDER="openai"
 export COMMITIA_LANGUAGE="en"
 export OPENAI_API_KEY="sk-..."
 ```
+
+### Atualização automática do commitia
+
+Antes de gerar o commit, o CommitIA confere se existe uma versão **mais nova** (comparação numérica: `1.0.10` > `1.0.9`). Se existir, ele avisa e pergunta:
+
+```
+ℹ Nova versão 1.0.16 disponível (você está na 1.0.15)
+Deseja atualizar agora? [S/n]
+```
+
+- **Sim** (ou Enter): atualiza o binário e continua o commit já com a versão nova (o commitia é reexecutado com os mesmos argumentos). Se a atualização falhar, avisa e segue com a versão atual.
+- **Não**: segue com a versão atual (o aviso volta enquanto houver versão pendente).
+- **Sem terminal interativo** (pipe/CI): apenas informa a nova versão e segue; nada é alterado.
+- **`--dry-run`**: apenas informa a nova versão, sem perguntar e sem alterar o binário.
+- Não roda com `--help`, `--version` e `--update`. Offline, a consulta (timeout de 3s) falha em silêncio.
+- Rodando a partir de um clone do repositório (pasta com `.git`), o commitia não se sobrescreve: só informa.
+
+O resultado da consulta fica em cache em `~/.commitia/update-check`, evitando latência de rede em todo commit.
+
+| Variável                              | Padrão  | Descrição                                                    |
+| ------------------------------------- | ------- | ------------------------------------------------------------ |
+| `COMMITIA_SKIP_UPDATE_CHECK`          | `false` | `true` desliga a checagem de nova versão                     |
+| `COMMITIA_UPDATE_CHECK_INTERVAL_HOURS`| `24`    | Intervalo mínimo entre consultas à rede (`0` = sempre)       |
 
 ## 🤖 Provedores de IA
 
@@ -241,6 +268,8 @@ Antes de gerar a mensagem, o commitia valida a CLI **por capacidade**: o `--help
 
 Se mesmo assim a CLI responder com `unknown option`, `unrecognized option` ou similar, o commitia mostra a mesma mensagem de atualização (o log em `.commitia/logs/` mantém a saída original) e não usa o fallback de arquivos grandes para esconder o problema.
 
+Em terminal interativo, ao detectar uma CLI desatualizada o commitia pergunta `Deseja atualizar agora? [S/n]` e roda o comando de atualização da tabela (`cursor-agent update` ou `npm install -g <pacote>@latest`). Se a atualização der certo, ele revalida a CLI e segue para gerar e aplicar o commit; se você recusar ou ela falhar, aborta com a mensagem acima. Sem terminal interativo ou com `--dry-run`, só avisa e aborta (nada é instalado).
+
 Para pular a validação preventiva (por exemplo, com uma CLI que oculta flags no `--help`):
 
 ```bash
@@ -288,6 +317,76 @@ COMMITIA_LARGE_FILE_PATTERNS="pnpm-lock.yaml yarn.lock *.lock docs/*.generated.j
 ```
 
 Os padrões são globs separados por espaço ou vírgula e comparados com o nome do arquivo e com o caminho completo. Defina `COMMITIA_LARGE_FILE_PATTERNS=""` para desativar a detecção por nome.
+
+## 🙈 `.commitiaignore`: controle o que é commitado e o que vai para a IA
+
+> ⚠️ **Atenção: a semântica NÃO é a do `.gitignore`.** O Git não ignora nada por causa deste arquivo. Ele só muda o que o **commitia** faz: o que adiciona ao commit (`git add` automático) e o que envia à IA.
+
+Crie um arquivo `.commitiaignore` na **raiz do repositório** (opcional; sem ele, nada muda). Uma entrada por linha; linhas vazias e comentários (`#`) são ignorados; aceita globs parecidos com os do `.gitignore` (`*.lock`, `dir/**`, `**/gen/*.js`, `build/`, `/raiz.txt`...).
+
+| Entrada                | O arquivo é commitado?                                                         | O diff vai para a IA?                                   |
+| ---------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------- |
+| `+package-lock.json` (prefixo `+`) | ✅ **Sim**, normalmente (entra no `git add` automático e no mesmo commit) | ❌ **Não**: o conteúdo/diff nunca é enviado             |
+| `.env.local` (sem prefixo)         | ❌ **Não é adicionado automaticamente**; entra **só se você já fez `git add`** | ✅ Sim, se você o colocou no stage (escolha explícita sua) |
+
+```gitignore
+# .commitiaignore
+
+# Entram no commit, mas a IA não os analisa (lockfiles, artefatos gerados...)
++package-lock.json
++pnpm-lock.yaml
++dist/**
+
+# Nunca commitados "sozinhos": só com `git add` explícito antes do commitia
+.env.local
+*.pem
+tmp/
+```
+
+**Como funciona**
+
+- **`+arquivo`**: commitado junto com os demais arquivos, mas fora da análise da IA (nem o diff completo, nem o resumo de fallback). A IA só recebe uma nota com o **nome** do arquivo omitido. Esses arquivos não são tratados como "arquivos grandes" (não ganham commit separado). Se **todos** os arquivos do commit forem `+`, a IA nem é chamada e vale a mensagem padrão (`chore(deps): atualiza package-lock.json`).
+- **`arquivo`** (sem prefixo): o `git add` automático **pula** o arquivo (a saída lista o que ficou de fora). Se você fizer `git add arquivo` **antes** de rodar o `commitia`, ele **entra no commit**, nunca é removido do stage e o diff **vai à IA** como o de qualquer arquivo (você escolheu commitá-lo). Passar o arquivo explicitamente (`commitia .env.local`) equivale a um `git add` manual; passar um diretório continua respeitando o `.commitiaignore`.
+- **Precedência**: os dois tipos de regra atuam em eixos independentes. Se um arquivo casar com `arquivo` **e** com `+arquivo`, ele não é adicionado automaticamente (regra sem prefixo) e, se você o colocar no stage, é commitado mas **nunca** enviado à IA (regra `+`). A ordem das linhas não importa.
+
+Detalhes completos (tabela de padrões, comparação com o `.gitignore`, exemplos): [docs/COMMITIAIGNORE.md](docs/COMMITIAIGNORE.md). Modelo pronto: [`.commitiaignore.example`](.commitiaignore.example). Também descrito em `commitia --help`.
+
+## 🧠 Skill para agentes de IA
+
+O comando `commitia skill` gera uma [Agent Skill](https://agentskills.io) (`SKILL.md`) que explica os recursos do CommitIA para o agente de IA do seu editor. Assim, quando você pedir "faça o commit", o agente usa o `commitia` (com stage explícito, `--no-stage`, `--dry-run`, tratamento de erros etc.) em vez de escrever a mensagem por conta própria.
+
+```bash
+# Escolhe o destino de forma interativa
+commitia skill
+
+# Instala no projeto atual
+commitia skill cursor
+commitia skill vscode
+commitia skill copilot
+commitia skill claude
+
+# Instala para o seu usuário (vale para todos os projetos)
+commitia skill cursor --global
+
+# Apenas gera o arquivo, para incluir onde preferir
+commitia skill file                       # grava ./commitia-skill.md
+commitia skill file -o docs/ia/SKILL.md   # caminho customizado
+commitia skill file -o -                  # imprime na tela
+```
+
+| Destino   | Projeto                                 | Global (`--global`)                  |
+| --------- | --------------------------------------- | ------------------------------------ |
+| `cursor`  | `.cursor/skills/commitia/SKILL.md`      | `~/.cursor/skills/commitia/SKILL.md` |
+| `vscode`  | `.github/skills/commitia/SKILL.md`      | `~/.copilot/skills/commitia/SKILL.md` |
+| `copilot` | `.github/skills/commitia/SKILL.md`      | `~/.copilot/skills/commitia/SKILL.md` |
+| `claude`  | `.claude/skills/commitia/SKILL.md`      | `~/.claude/skills/commitia/SKILL.md` |
+| `file`    | `./commitia-skill.md` (ou `-o <caminho>`) | -                                    |
+
+- Em um repositório Git, a pasta do projeto é a raiz do repositório (mesmo rodando de uma subpasta).
+- É possível informar vários destinos de uma vez: `commitia skill cursor copilot`.
+- Se já existir uma skill diferente no destino, o commitia não sobrescreve; use `--force`. Se for idêntica, nada é alterado. Ao atualizar o commitia, rode `commitia skill <destino> --force` para renovar a skill.
+- `--dry-run` mostra onde a skill seria gravada, sem criar arquivos.
+- `skill` só é tratado como subcomando quando é o **primeiro** argumento; para commitar um arquivo chamado `skill`, use `commitia ./skill`.
 
 ## 🔄 Integração com branches
 

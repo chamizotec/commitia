@@ -1,0 +1,38 @@
+# .commitiaignore — exemplo
+# Copie para a raiz do seu repositório como .commitiaignore.
+#
+# ATENÇÃO: a semântica é DIFERENTE da do .gitignore. O Git não ignora nada por causa
+# deste arquivo; ele só controla o que o comando `commitia` adiciona e envia à IA.
+#
+# Uma entrada por linha. Linhas vazias e comentários (#) são ignorados.
+# Aceita globs parecidos com os do .gitignore: *, ?, [abc], **, dir/, /raiz, dir/**
+# (negação com ! não é suportada).
+#
+# Mais detalhes: docs/COMMITIAIGNORE.md
+
+# ---------------------------------------------------------------------------
+# +padrão  =>  é COMMITADO normalmente (entra no git add automático),
+#              mas o conteúdo/diff NÃO é enviado à IA para gerar a mensagem.
+# ---------------------------------------------------------------------------
++package-lock.json
++pnpm-lock.yaml
++yarn.lock
++*.min.js
++dist/**
+
+# ---------------------------------------------------------------------------
+# padrão   =>  NÃO é commitado automaticamente pelo commitia.
+#              Só entra no commit se VOCÊ já tiver feito `git add <arquivo>`
+#              antes de rodar o commitia (nesse caso o diff vai à IA, salvo se
+#              o arquivo também casar com uma entrada '+').
+# ---------------------------------------------------------------------------
+.env.local
+.env.*.local
+*.pem
+notas-pessoais.md
+tmp/
+
+# Arquivo que casa com as duas regras: não é adicionado automaticamente e,
+# se você o colocar no stage, é commitado mas NUNCA enviado à IA.
+# segredo.dat
+# +segredo.dat

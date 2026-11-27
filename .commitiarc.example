@@ -100,6 +100,8 @@
 # lista as flags que ele usa e, se faltar alguma, pede para atualizar a CLI.
 # Para pular essa checagem (padrão: false):
 # COMMITIA_SKIP_CLI_VERSION_CHECK="true"
+# Com uma CLI desatualizada, em terminal interativo o commitia pergunta "Deseja atualizar agora? [S/n]"
+# e roda o comando de atualização da CLI (sem terminal interativo ou com --dry-run só avisa e aborta).
 # Modelo opcional por CLI (padrão: o da própria CLI):
 # COMMITIA_CURSOR_MODEL=""
 # COMMITIA_COPILOT_MODEL=""
@@ -107,3 +109,15 @@
 # COMMITIA_CODEX_MODEL=""
 # COMMITIA_GEMINI_CLI_MODEL=""
 
+# ---------------------------------------------------------------------------
+# Atualização do commitia
+# ---------------------------------------------------------------------------
+# Antes de gerar o commit, o commitia consulta se há versão mais nova (timeout de 3s; falha de
+# rede é silenciosa). Em terminal interativo pergunta "Deseja atualizar agora? [S/n]" e, se sim,
+# atualiza e continua o commit com a versão nova. Sem terminal interativo (pipe/CI) ou com
+# --dry-run apenas informa a nova versão (nada é alterado). Não roda com --help/--version/--update.
+# Desliga a checagem de nova versão (padrão: false):
+# COMMITIA_SKIP_UPDATE_CHECK="true"
+# Intervalo mínimo entre consultas à rede, em horas (padrão: 24; 0 = consulta sempre).
+# O resultado fica em ~/.commitia/update-check e o aviso continua enquanto houver versão pendente:
+# COMMITIA_UPDATE_CHECK_INTERVAL_HOURS="24"

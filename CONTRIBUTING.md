@@ -55,7 +55,9 @@ commitia/
 ├── tests/
 │   └── run_tests.sh      # Testes
 ├── docs/
+│   ├── COMMITIAIGNORE.md # Guia do .commitiaignore
 │   └── ...               # Documentação adicional
+├── .commitiaignore.example # Modelo de .commitiaignore
 ├── install.sh            # Instalador
 ├── uninstall.sh          # Desinstalador
 ├── README.md
