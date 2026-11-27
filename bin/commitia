@@ -12,7 +12,8 @@ set -e
 VERSION="1.0.15"
 SCRIPT_NAME="commitia"
 REPO_URL="https://github.com/chamizotec/commitia"
-REPO_RAW_URL="https://raw.githubusercontent.com/chamizotec/commitia/main"
+# COMMITIA_REPO_RAW_URL permite apontar para outra origem (uso avançado e testes)
+REPO_RAW_URL="${COMMITIA_REPO_RAW_URL:-https://raw.githubusercontent.com/chamizotec/commitia/main}"
 
 # Cores para output
 RED='\033[0;31m'
@@ -30,6 +31,14 @@ DRY_RUN=false
 INTERACTIVE=false
 AMEND=false
 FORCE_UPDATE=false
+
+# Checagem de nova versão do commitia (valores finais definidos em load_config)
+SKIP_UPDATE_CHECK=false
+UPDATE_CHECK_INTERVAL_HOURS=24
+# Tempo máximo (s) da consulta de versão remota: não pode atrasar o commit offline
+UPDATE_CHECK_TIMEOUT=3
+# Argumentos originais (para reexecutar o commitia após uma atualização)
+ORIG_ARGS=()
 
 # jq disponível? (fallback para grep/sed quando não instalado)
 HAS_JQ=false
@@ -274,6 +283,7 @@ print_help() {
   print_banner
   echo -e "${BOLD}USO:${NC}"
   echo "  $SCRIPT_NAME [opções] [arquivos...]"
+  echo "  $SCRIPT_NAME skill [destino] [opções]   Cria uma skill para agentes de IA (veja SKILL)"
   echo ""
   echo -e "${BOLD}OPÇÕES:${NC}"
   echo "  -m, --message <texto>    Contexto adicional para a mensagem de commit"
@@ -321,6 +331,8 @@ print_help() {
   echo "    - COMMITIA_CLI_TIMEOUT: tempo máximo em segundos das CLIs de IA (padrão: 120)"
   echo "    - COMMITIA_<CLI>_MODEL: modelo opcional (CURSOR, COPILOT, CLAUDE, CODEX, GEMINI_CLI)"
   echo "    - COMMITIA_SKIP_CLI_VERSION_CHECK: true pula a validação de versão das CLIs (padrão: false)"
+  echo "    - COMMITIA_SKIP_UPDATE_CHECK: true desliga o aviso de nova versão do commitia (padrão: false)"
+  echo "    - COMMITIA_UPDATE_CHECK_INTERVAL_HOURS: intervalo mínimo entre consultas de versão, em horas (padrão: 24; 0 = sempre)"
   echo "    - COMMITIA_LANGUAGE: pt, en, es (padrão: pt)"
   echo "    - COMMITIA_AUTO_STAGE: true, false (padrão: true)"
   echo "    - COMMITIA_LARGE_FILES: true, false - trata arquivos grandes em commits separados (padrão: true)"
@@ -328,12 +340,33 @@ print_help() {
   echo "    - COMMITIA_LARGE_FILE_BYTES: bytes do diff/binário para considerar grande (padrão: 100000; 0 desativa)"
   echo "    - COMMITIA_LARGE_FILE_PATTERNS: globs de arquivos sempre grandes, ex.: lockfiles (padrão: lista de lockfiles)"
   echo ""
+  echo -e "${BOLD}ATUALIZAÇÕES:${NC}"
+  echo "  Antes de commitar, o commitia consulta (no máx. 1x por dia, com timeout de 3s e sem erro offline)"
+  echo "  se há versão mais nova. Em terminal interativo pergunta 'Deseja atualizar agora? [S/n]'; se sim,"
+  echo "  atualiza e continua o commit com a versão nova. Sem terminal interativo ou com --dry-run apenas"
+  echo "  informa (nada é alterado). Com uma CLI de IA desatualizada, também oferece atualizá-la."
+  echo ""
+  echo -e "${BOLD}SKILL PARA AGENTES DE IA:${NC}"
+  echo "  $SCRIPT_NAME skill <cursor|vscode|copilot|claude|file> [--global]"
+  echo "  Gera uma skill que ensina agentes de IA a usar o commitia para commitar."
+  echo "  Em 'file' apenas gera o arquivo para você incluir onde preferir. Veja: $SCRIPT_NAME skill --help"
+  echo ""
   echo -e "${BOLD}ARQUIVOS GRANDES:${NC}"
   echo "  Lockfiles (pnpm-lock.yaml, package-lock.json, yarn.lock...) e arquivos com diff muito grande"
   echo "  são commitados separadamente: primeiro os pequenos, depois cada arquivo grande. Se a IA falhar"
   echo "  com o diff completo, o commitia envia só nome, linhas alteradas e contexto resumido (mais o"
   echo "  último commit da sessão, se houver) e, em último caso, usa uma mensagem padrão. Sem commit na"
   echo "  sessão, vai direto para a mensagem padrão. Com --amend não há separação."
+  echo ""
+  echo -e "${BOLD}.COMMITIAIGNORE:${NC}"
+  echo "  Arquivo opcional na raiz do repositório. ATENÇÃO: a semântica é DIFERENTE da do .gitignore"
+  echo "  (o Git não ignora nada; o arquivo só controla o que o commitia adiciona e envia à IA)."
+  echo "  Uma entrada por linha; linhas vazias e comentários (#) são ignorados; aceita globs (*.lock, dir/**)."
+  echo "    +package-lock.json   É commitado normalmente, mas o diff NÃO é enviado à IA"
+  echo "    .env.local           NÃO é adicionado automaticamente pelo commitia (git add); só entra no"
+  echo "                         commit se você já o tiver colocado no stage (git add) antes"
+  echo "  Arquivo staged manualmente e sem prefixo: entra no commit e o diff vai à IA (escolha sua),"
+  echo "  salvo se casar também com uma entrada '+'. Os dois eixos (commit x IA) são independentes."
   echo ""
 }
 
@@ -358,6 +391,25 @@ info() {
   echo -e "${BLUE}ℹ $1${NC}"
 }
 
+# stdin e stdout são um terminal? (COMMITIA_TEST_FORCE_TTY=true só para os testes,
+# que simulam o terminal com stdin em pipe)
+is_interactive_terminal() {
+  [ "${COMMITIA_TEST_FORCE_TTY:-}" = "true" ] && return 0
+  [ -t 0 ] && [ -t 1 ]
+}
+
+# Pergunta "[S/n]" e lê uma linha. Retorna 0 para sim (Enter também é sim) e
+# 1 para não. Fim da entrada (EOF) sem resposta conta como não.
+ask_yes_no() {
+  local response=""
+  echo -e "${YELLOW}$1 [S/n]${NC}"
+  read -r response || [ -n "$response" ] || response="n"
+  case "$response" in
+    [Nn]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # ============================================================================
 # Validações
 # ============================================================================
@@ -377,7 +429,8 @@ CLI_VERSION_CACHE=""
 CLI_MISSING_FLAGS=""
 
 # Define os dados da CLI do provedor atual (CLI_BIN, CLI_HELP_ARGS,
-# CLI_REQUIRED_FLAGS, CLI_UPDATE_CMD). Retorna 1 se o provedor não usa CLI.
+# CLI_REQUIRED_FLAGS, CLI_UPDATE_CMD para exibir, CLI_UPDATE_RUN para executar).
+# Retorna 1 se o provedor não usa CLI.
 load_cli_spec() {
   case "$AI_PROVIDER" in
     cursor)
@@ -385,30 +438,35 @@ load_cli_spec() {
       CLI_HELP_ARGS="--help"
       CLI_REQUIRED_FLAGS="--print --output-format --mode"
       CLI_UPDATE_CMD="cursor-agent update"
+      CLI_UPDATE_RUN="cursor-agent update"
       ;;
     copilot)
       CLI_BIN="copilot"
       CLI_HELP_ARGS="--help"
       CLI_REQUIRED_FLAGS="--prompt --silent --no-color --no-ask-user --no-custom-instructions --no-auto-update --disable-builtin-mcps --deny-tool"
       CLI_UPDATE_CMD="npm install -g @github/copilot@latest  (ou: copilot update)"
+      CLI_UPDATE_RUN="npm install -g @github/copilot@latest"
       ;;
     claude)
       CLI_BIN="claude"
       CLI_HELP_ARGS="--help"
       CLI_REQUIRED_FLAGS="--print --tools --disable-slash-commands --strict-mcp-config --no-session-persistence --output-format"
       CLI_UPDATE_CMD="npm install -g @anthropic-ai/claude-code@latest  (ou: claude update)"
+      CLI_UPDATE_RUN="npm install -g @anthropic-ai/claude-code@latest"
       ;;
     codex)
       CLI_BIN="codex"
       CLI_HELP_ARGS="exec --help"
       CLI_REQUIRED_FLAGS="--skip-git-repo-check --ephemeral --sandbox --color --output-last-message"
       CLI_UPDATE_CMD="npm install -g @openai/codex@latest  (ou: codex update)"
+      CLI_UPDATE_RUN="npm install -g @openai/codex@latest"
       ;;
     gemini-cli)
       CLI_BIN="gemini"
       CLI_HELP_ARGS="--help"
       CLI_REQUIRED_FLAGS="--approval-mode --skip-trust --output-format --prompt"
       CLI_UPDATE_CMD="npm install -g @google/gemini-cli@latest"
+      CLI_UPDATE_RUN="npm install -g @google/gemini-cli@latest"
       ;;
     *)
       return 1
@@ -487,12 +545,57 @@ print_cli_outdated() {
   echo -e "  Ou use outro provedor: ${BOLD}$SCRIPT_NAME --provider <provedor>${NC}" >&2
 }
 
+# Em terminal interativo, oferece atualizar a CLI desatualizada (CLI_UPDATE_RUN).
+# Retorna 0 se a atualização rodou com sucesso (caches do --help limpos para
+# revalidar) e 1 se não houve atualização (modo não interativo, --dry-run,
+# recusa ou falha); nesse caso o chamador aborta com a mensagem de atualização.
+offer_cli_update() {
+  # Não interativo ou --dry-run: não altera nada nem pergunta
+  is_interactive_terminal || return 1
+  [ "$DRY_RUN" = true ] && return 1
+
+  local -a update_cmd
+  read -ra update_cmd <<< "$CLI_UPDATE_RUN"
+  [ ${#update_cmd[@]} -gt 0 ] || return 1
+  if ! command -v "${update_cmd[0]}" &>/dev/null; then
+    warn "'${update_cmd[0]}' não encontrado; não é possível atualizar a CLI automaticamente"
+    return 1
+  fi
+
+  echo "" >&2
+  warn "A CLI '$CLI_BIN' está desatualizada (não suporta: $CLI_MISSING_FLAGS)"
+  if ! ask_yes_no "Deseja atualizar agora? (${CLI_UPDATE_RUN})"; then
+    return 1
+  fi
+
+  info "Executando: ${CLI_UPDATE_RUN}"
+  if ! "${update_cmd[@]}"; then
+    warn "A atualização da CLI '$CLI_BIN' falhou"
+    return 1
+  fi
+
+  # Revalida: o --help e a versão precisam ser lidos de novo
+  hash -r 2>/dev/null || true
+  CLI_HELP_LOADED=false
+  CLI_HELP_CACHE=""
+  CLI_VERSION_CACHE=""
+  success "CLI '$CLI_BIN' atualizada; revalidando..."
+  return 0
+}
+
 # Validação preventiva: aborta antes de gerar a mensagem se a CLI estiver desatualizada
+# (em terminal interativo, antes oferece atualizar a CLI e continua se der certo)
 check_cli_version() {
   [ "$SKIP_CLI_VERSION_CHECK" = true ] && return 0
   load_cli_spec || return 0
 
   find_missing_cli_flags
+  if [ -n "$CLI_MISSING_FLAGS" ] && offer_cli_update; then
+    find_missing_cli_flags
+    if [ -n "$CLI_MISSING_FLAGS" ]; then
+      warn "Mesmo após atualizar, a CLI '$CLI_BIN' ainda não suporta: $CLI_MISSING_FLAGS"
+    fi
+  fi
   if [ -n "$CLI_MISSING_FLAGS" ]; then
     print_cli_outdated "$CLI_MISSING_FLAGS" ""
     echo -e "  Para pular esta checagem: COMMITIA_SKIP_CLI_VERSION_CHECK=true" >&2
@@ -609,6 +712,111 @@ check_unstaged_changes() {
 # Atualização
 # ============================================================================
 
+# --- Funções reutilizáveis (nunca chamam exit e não definem traps) ------------
+
+# Versão no formato numérico X.Y.Z (aceita sufixo, ex.: 1.0.16-beta)
+is_valid_version() {
+  [[ "$1" =~ ^[0-9]+(\.[0-9]+)*([-+._][0-9A-Za-z._-]*)?$ ]]
+}
+
+# Compara versões semanticamente (numérico por componente): retorna 0 se $1 > $2.
+# Sufixos de pré-release (-beta) são ignorados; componentes ausentes valem 0.
+version_gt() {
+  local IFS=.
+  local -a a b
+  read -ra a <<< "$1"
+  read -ra b <<< "$2"
+  local i n=${#a[@]} x y
+  [ ${#b[@]} -gt "$n" ] && n=${#b[@]}
+  for ((i = 0; i < n; i++)); do
+    x="${a[i]:-0}"; x="${x%%[!0-9]*}"; x=$((10#${x:-0}))
+    y="${b[i]:-0}"; y="${y%%[!0-9]*}"; y=$((10#${y:-0}))
+    if [ "$x" -gt "$y" ]; then return 0; fi
+    if [ "$x" -lt "$y" ]; then return 1; fi
+  done
+  return 1
+}
+
+# Resolve o caminho absoluto de um arquivo, seguindo symlinks
+resolve_path() {
+  local p="$1" link dir
+  while [ -L "$p" ]; do
+    link=$(readlink "$p")
+    case "$link" in
+      /*) p="$link" ;;
+      *) p="$(dirname "$p")/$link" ;;
+    esac
+  done
+  dir=$(cd "$(dirname "$p")" 2>/dev/null && pwd -P) || return 1
+  echo "$dir/$(basename "$p")"
+}
+
+# Extrai a versão (VERSION="x.y.z") de um script commitia
+extract_script_version() {
+  grep -m1 '^VERSION=' "$1" 2>/dev/null | cut -d'"' -f2
+}
+
+# Baixa o script remoto (mesma fonte para --update e para a checagem automática).
+# $1: arquivo de destino; $2: tempo máximo em segundos (opcional).
+download_remote_script() {
+  local dest="$1" max_time="${2:-}"
+  local -a opts=(-fsSL)
+  [ -n "$max_time" ] && opts+=(--connect-timeout "$max_time" --max-time "$max_time")
+  curl "${opts[@]}" "$REPO_RAW_URL/bin/commitia" -o "$dest" 2>/dev/null
+}
+
+# Instala o script em $2 de forma atômica (cópia ao lado + mv): o arquivo
+# antigo só é trocado se a cópia completa deu certo, e o bash em execução
+# (que lê o script aos poucos) continua com o arquivo antigo.
+# Retorna 1 em caso de falha, sem alterar o destino.
+install_script() {
+  local src="$1" dest="$2" tmp_dest
+  tmp_dest="${dest}.new.$$"
+  mkdir -p "$(dirname "$dest")" 2>/dev/null || true
+  if cp "$src" "$tmp_dest" 2>/dev/null && chmod +x "$tmp_dest" 2>/dev/null \
+    && mv -f "$tmp_dest" "$dest" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp_dest" 2>/dev/null || true
+  return 1
+}
+
+# Baixa e instala a versão remota em $1, sem prompts e sem exit.
+# Retorna 0 se atualizou; 1 se falhou (mensagem via warn). A versão
+# instalada fica em UPDATE_INSTALLED_VERSION.
+apply_self_update() {
+  local dest="$1" temp_dir remote_script remote_version rc=0
+  UPDATE_INSTALLED_VERSION=""
+
+  if ! command -v curl &>/dev/null; then
+    warn "curl é necessário para atualizar"
+    return 1
+  fi
+  temp_dir=$(mktemp -d) || return 1
+  remote_script="$temp_dir/commitia"
+
+  if ! download_remote_script "$remote_script" 60; then
+    warn "Não foi possível baixar a nova versão. Verifique sua conexão."
+    rc=1
+  else
+    remote_version=$(extract_script_version "$remote_script")
+    if ! is_valid_version "$remote_version" || ! bash -n "$remote_script" 2>/dev/null; then
+      warn "O arquivo baixado não é um commitia válido; a atualização foi cancelada"
+      rc=1
+    elif ! install_script "$remote_script" "$dest"; then
+      warn "Não foi possível gravar em $dest. Verifique as permissões."
+      rc=1
+    else
+      UPDATE_INSTALLED_VERSION="$remote_version"
+    fi
+  fi
+
+  rm -rf "$temp_dir"
+  return $rc
+}
+
+# --- Atualização manual (--update) ---------------------------------------------
+
 do_update() {
   print_banner
   info "Verificando atualizações..."
@@ -618,7 +826,7 @@ do_update() {
     error "curl é necessário para atualização. Instale o curl primeiro."
   fi
   
-  # Cria diretório temporário
+  # Cria diretório temporário (este caminho sempre termina com exit)
   local temp_dir
   temp_dir=$(mktemp -d)
   trap "rm -rf $temp_dir" EXIT
@@ -627,13 +835,13 @@ do_update() {
   info "Baixando informações da versão mais recente..."
   local remote_script="$temp_dir/commitia"
   
-  if ! curl -fsSL "$REPO_RAW_URL/bin/commitia" -o "$remote_script" 2>/dev/null; then
+  if ! download_remote_script "$remote_script"; then
     error "Não foi possível conectar ao repositório. Verifique sua conexão."
   fi
   
   # Extrai versão remota
   local remote_version
-  remote_version=$(grep -m1 '^VERSION=' "$remote_script" | cut -d'"' -f2)
+  remote_version=$(extract_script_version "$remote_script")
   
   if [ -z "$remote_version" ]; then
     error "Não foi possível determinar a versão remota"
@@ -667,28 +875,170 @@ do_update() {
   fi
   
   # Determina o diretório de instalação
-  local install_dir
   local current_script
   current_script=$(command -v commitia 2>/dev/null || echo "$HOME/.local/bin/commitia")
-  install_dir=$(dirname "$current_script")
   
-  # Faz backup do script atual
-  info "Criando backup..."
-  cp "$current_script" "$temp_dir/commitia.backup" 2>/dev/null || true
-  
-  # Instala a nova versão
+  # Instala a nova versão (atômico: o script atual só é trocado se a cópia deu certo)
   info "Instalando versão $remote_version..."
   
-  if cp "$remote_script" "$current_script" && chmod +x "$current_script"; then
+  if install_script "$remote_script" "$current_script"; then
     success "Atualizado com sucesso para a versão $remote_version!"
     echo ""
     echo -e "${CYAN}Novidades: ${REPO_URL}/releases${NC}"
   else
-    # Tenta restaurar backup
-    warn "Falha na atualização. Restaurando versão anterior..."
-    cp "$temp_dir/commitia.backup" "$current_script" 2>/dev/null || true
     error "Não foi possível atualizar. Verifique as permissões."
   fi
+}
+
+# --- Checagem automática de nova versão (antes de commitar) --------------------
+
+update_cache_file() {
+  echo "${HOME}/.commitia/update-check"
+}
+
+# Lê o cache (UC_VERSION = última versão remota conhecida; UC_NEXT = epoch da
+# próxima consulta permitida). Nunca faz source do arquivo.
+read_update_cache() {
+  UC_VERSION=""
+  UC_NEXT=0
+  local f line
+  f=$(update_cache_file)
+  [ -f "$f" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      remote_version=*) UC_VERSION="${line#remote_version=}" ;;
+      next_check=*) UC_NEXT="${line#next_check=}" ;;
+    esac
+  done < "$f"
+  is_valid_version "$UC_VERSION" || UC_VERSION=""
+  case "$UC_NEXT" in
+    ''|*[!0-9]*) UC_NEXT=0 ;;
+  esac
+  return 0
+}
+
+# Grava o cache (falhas de escrita são ignoradas). $1: versão; $2: próxima consulta (epoch)
+write_update_cache() {
+  local f tmp
+  f=$(update_cache_file)
+  mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
+  tmp="${f}.$$"
+  if printf 'remote_version=%s\nnext_check=%s\n' "$1" "$2" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  else
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Consulta a versão remota com timeout curto e em silêncio. Imprime a versão
+# ou retorna 1 em qualquer falha (sem rede, timeout, resposta inválida).
+fetch_remote_version() {
+  command -v curl &>/dev/null || return 1
+  local body version
+  body=$(curl -fsSL --connect-timeout "$UPDATE_CHECK_TIMEOUT" --max-time "$UPDATE_CHECK_TIMEOUT" \
+    "$REPO_RAW_URL/bin/commitia" 2>/dev/null) || return 1
+  version=$(grep -m1 '^VERSION=' <<< "$body" | cut -d'"' -f2)
+  is_valid_version "$version" || return 1
+  echo "$version"
+}
+
+# Última versão remota conhecida: usa o cache enquanto válido (intervalo em horas);
+# senão consulta a rede. Em falha de rede mantém a versão em cache e só tenta de
+# novo depois de no máx. 1h (offline não paga a espera do timeout a cada commit).
+# Imprime a versão (pode ser vazia) e sempre retorna 0.
+get_latest_version() {
+  local now interval_secs next version
+  now=$(date +%s)
+  interval_secs=$((UPDATE_CHECK_INTERVAL_HOURS * 3600))
+  read_update_cache
+
+  if [ "$interval_secs" -gt 0 ] && [ "$now" -lt "$UC_NEXT" ] && [ -n "$UC_VERSION" ]; then
+    echo "$UC_VERSION"
+    return 0
+  fi
+
+  # Falha recente (sem versão em cache): também respeita o intervalo de retry
+  if [ "$interval_secs" -gt 0 ] && [ "$now" -lt "$UC_NEXT" ]; then
+    return 0
+  fi
+
+  if version=$(fetch_remote_version); then
+    write_update_cache "$version" $((now + interval_secs))
+    echo "$version"
+  else
+    next=$((now + 3600))
+    [ "$interval_secs" -gt 0 ] && [ "$interval_secs" -lt 3600 ] && next=$((now + interval_secs))
+    [ "$interval_secs" -eq 0 ] && next=$now
+    write_update_cache "$UC_VERSION" "$next"
+    [ -n "$UC_VERSION" ] && echo "$UC_VERSION"
+  fi
+  return 0
+}
+
+# Verifica se há versão mais nova do commitia antes de commitar. Nunca bloqueia:
+# falhas de rede são silenciosas e falhas de atualização seguem com a versão atual.
+# Se o usuário aceitar atualizar, reexecuta o commitia novo com os mesmos argumentos.
+check_self_update() {
+  [ "$SKIP_UPDATE_CHECK" = true ] && return 0
+  # Já reexecutado após atualização: evita loop de reexecução
+  [ "${COMMITIA_UPDATED_REEXEC:-}" = "1" ] && return 0
+  # Fora de um repositório Git o fluxo aborta de qualquer forma
+  git rev-parse --is-inside-work-tree &>/dev/null || return 0
+
+  local latest
+  latest=$(get_latest_version) || return 0
+  [ -n "$latest" ] || return 0
+  version_gt "$latest" "$VERSION" || return 0
+
+  echo ""
+  info "Nova versão $latest disponível (você está na $VERSION)"
+
+  # --dry-run não altera nada: só informa
+  if [ "$DRY_RUN" = true ]; then
+    info "Modo --dry-run: o commitia não será atualizado. Para atualizar: $SCRIPT_NAME --update"
+    echo ""
+    return 0
+  fi
+
+  # Sem terminal interativo (pipe/CI): só informa e segue
+  if ! is_interactive_terminal; then
+    info "Para atualizar: $SCRIPT_NAME --update (ou defina COMMITIA_SKIP_UPDATE_CHECK=true para silenciar)"
+    echo ""
+    return 0
+  fi
+
+  # Atualiza o próprio script em execução; clone de desenvolvimento não é sobrescrito
+  local self_path
+  self_path=$(resolve_path "${BASH_SOURCE[0]}") || self_path=""
+  if [ -z "$self_path" ] || [ -e "$(dirname "$self_path")/../.git" ]; then
+    info "Executando a partir de um clone do repositório; atualize com git pull ou $SCRIPT_NAME --update"
+    echo ""
+    return 0
+  fi
+
+  if ! ask_yes_no "Deseja atualizar agora?"; then
+    info "Seguindo com a versão atual ($VERSION)"
+    echo ""
+    return 0
+  fi
+
+  info "Atualizando para a versão $latest..."
+  if ! apply_self_update "$self_path"; then
+    warn "A atualização falhou; seguindo com a versão atual ($VERSION)"
+    echo ""
+    return 0
+  fi
+  success "Atualizado para a versão ${UPDATE_INSTALLED_VERSION}! Continuando o commit com a versão nova..."
+  echo ""
+
+  # Reexecuta o commitia atualizado (proteção contra loop via variável de ambiente)
+  export COMMITIA_UPDATED_REEXEC=1
+  shopt -s execfail
+  exec "$self_path" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+  # Só chega aqui se o exec falhar: segue com esta execução
+  warn "Não foi possível reiniciar o commitia atualizado; seguindo com a versão atual"
+  return 0
 }
 
 # ============================================================================
@@ -724,6 +1074,8 @@ load_config() {
   LANGUAGE="${CLI_LANGUAGE:-${COMMITIA_LANGUAGE:-pt}}"
   AUTO_STAGE="${CLI_AUTO_STAGE:-${COMMITIA_AUTO_STAGE:-true}}"
   SKIP_CLI_VERSION_CHECK="${COMMITIA_SKIP_CLI_VERSION_CHECK:-false}"
+  SKIP_UPDATE_CHECK="${COMMITIA_SKIP_UPDATE_CHECK:-false}"
+  UPDATE_CHECK_INTERVAL_HOURS=$(normalize_int "${COMMITIA_UPDATE_CHECK_INTERVAL_HOURS:-24}" 24 "COMMITIA_UPDATE_CHECK_INTERVAL_HOURS")
 
   # Arquivos grandes (lockfiles e diffs muito grandes)
   LARGE_FILES_ENABLED="${COMMITIA_LARGE_FILES:-true}"
@@ -752,6 +1104,328 @@ get_project_config_file() {
   if [ -n "$git_root" ] && [ -f "$git_root/.commitiarc" ]; then
     echo "$git_root/.commitiarc"
   fi
+}
+
+# ============================================================================
+# .commitiaignore (na raiz do repositório)
+#
+# ATENÇÃO: a semântica é DIFERENTE da do .gitignore. O arquivo NÃO faz o Git
+# ignorar nada; ele controla o que o commitia adiciona ao commit e o que ele
+# envia à IA. Uma entrada por linha (linhas vazias e '#' são ignoradas):
+#
+#   +padrao   o arquivo É commitado normalmente, mas seu diff NÃO vai para a IA.
+#   padrao    o arquivo NÃO é adicionado automaticamente pelo commitia (git add);
+#             só entra no commit se você já o tiver colocado no stage (git add).
+#             Nesse caso o diff vai à IA normalmente (escolha explícita sua).
+#
+# Os dois eixos são independentes: se o arquivo casa com '+' e sem prefixo, ele
+# não é adicionado automaticamente E, se for staged manualmente, o diff não vai
+# à IA (vale sempre a regra mais restritiva em cada eixo).
+#
+# Padrões (glob estilo .gitignore): '*', '?', '[abc]', '**', '/' no início ou no
+# meio ancora na raiz do repositório, '/' no fim casa só diretórios, sem '/' casa
+# o nome em qualquer pasta, '\' escapa. Negação ('!') não é suportada.
+# O módulo é mantido neste arquivo (e não em um lib/ separado) porque o instalador
+# e o --update distribuem somente bin/commitia.
+# ============================================================================
+
+IGNORE_FILE_NAME=".commitiaignore"
+
+# Regexes (ERE) das entradas: sem prefixo (não adicionar automaticamente) e '+' (fora da IA)
+IGNORE_MANUAL_RES=()
+IGNORE_NOAI_RES=()
+# Arquivos que o stage automático pulou por causa de entradas sem prefixo
+IGNORE_SKIPPED=()
+# Arquivos staged (no escopo atual) cujo conteúdo não vai à IA
+AI_EXCLUDED_FILES=()
+# Pathspecs do diff enviado à IA (escopo + exclusões); vazio = 'git diff --staged' puro
+DIFF_SPECS=()
+
+# Converte um glob estilo .gitignore em regex ERE que casa com caminhos relativos
+# à raiz do repositório (o arquivo ou qualquer coisa dentro de uma pasta casada).
+ignore_glob_to_regex() {
+  local pat="$1" anchored=false dir_only=false
+  local re="" i=0 n c next j k start neg cls rest after
+
+  case "$pat" in */) dir_only=true; pat="${pat%/}" ;; esac
+  case "$pat" in /*) anchored=true; pat="${pat#/}" ;; esac
+  case "$pat" in */*) anchored=true ;; esac
+
+  n=${#pat}
+  while [ "$i" -lt "$n" ]; do
+    c="${pat:$i:1}"
+    case "$c" in
+      '*')
+        if [ "${pat:$((i + 1)):1}" = "*" ]; then
+          j=$((i + 2))
+          while [ "${pat:$j:1}" = "*" ]; do j=$((j + 1)); done
+          # '**' só é especial como componente inteiro ('**/x', 'x/**', 'x/**/y')
+          if [ "$i" -eq 0 ] || [ "${pat:$((i - 1)):1}" = "/" ]; then
+            if [ "$j" -ge "$n" ]; then
+              re+='.*'; i=$j; continue
+            elif [ "${pat:$j:1}" = "/" ]; then
+              re+='(.*/)?'; i=$((j + 1)); continue
+            fi
+          fi
+          re+='[^/]*'; i=$j
+        else
+          re+='[^/]*'; i=$((i + 1))
+        fi
+        ;;
+      '?')
+        re+='[^/]'; i=$((i + 1))
+        ;;
+      '[')
+        k=$((i + 1)); neg=""
+        case "${pat:$k:1}" in '!'|'^') neg='^'; k=$((k + 1)) ;; esac
+        start=$k
+        [ "${pat:$k:1}" = "]" ] && k=$((k + 1))
+        while [ "$k" -lt "$n" ] && [ "${pat:$k:1}" != "]" ]; do
+          # classes POSIX ([:alpha:]) dentro do colchete
+          if [ "${pat:$k:2}" = "[:" ]; then
+            rest="${pat:$k}"
+            after="${rest#*:]}"
+            if [ "$after" != "$rest" ]; then
+              k=$((n - ${#after}))
+              continue
+            fi
+          fi
+          k=$((k + 1))
+        done
+        if [ "$k" -ge "$n" ]; then
+          re+='\['; i=$((i + 1))   # sem ']' de fechamento: '[' literal
+        else
+          cls="${pat:$start:$((k - start))}"
+          re+="[${neg}${cls}]"; i=$((k + 1))
+        fi
+        ;;
+      '\')
+        next="${pat:$((i + 1)):1}"
+        if [ -z "$next" ]; then
+          re+='\\'; i=$((i + 1))
+        else
+          case "$next" in
+            '.'|'^'|'$'|'+'|'('|')'|'{'|'}'|'|'|'['|']'|'\'|'*'|'?') re+="\\$next" ;;
+            *) re+="$next" ;;
+          esac
+          i=$((i + 2))
+        fi
+        ;;
+      '.'|'^'|'$'|'+'|'('|')'|'{'|'}'|'|'|']')
+        re+="\\$c"; i=$((i + 1))
+        ;;
+      *)
+        re+="$c"; i=$((i + 1))
+        ;;
+    esac
+  done
+
+  local prefix="" suffix='(/.*)?'
+  [ "$anchored" = true ] || prefix='(.*/)?'
+  [ "$dir_only" = true ] && suffix='/.*'
+  printf '%s' "^${prefix}${re}${suffix}\$"
+}
+
+# Lê um .commitiaignore e preenche IGNORE_MANUAL_RES / IGNORE_NOAI_RES.
+# Linhas vazias e comentários ('#') são ignorados; '+' marca "fora da IA".
+parse_ignore_file() {
+  local file="$1" line pat kind lineno=0
+  IGNORE_MANUAL_RES=()
+  IGNORE_NOAI_RES=()
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -n "$line" ] || continue
+    case "$line" in \#*) continue ;; esac
+
+    kind="manual"
+    pat="$line"
+    case "$line" in
+      '+'*)
+        kind="noai"
+        pat="${line#+}"
+        pat="${pat#"${pat%%[![:space:]]*}"}"
+        ;;
+      '!'*)
+        warn "$IGNORE_FILE_NAME linha $lineno: negação ('!') não é suportada; linha ignorada: $line"
+        continue
+        ;;
+    esac
+    if [ -z "$pat" ]; then
+      warn "$IGNORE_FILE_NAME linha $lineno: '+' sem padrão; linha ignorada"
+      continue
+    fi
+
+    if [ "$kind" = "noai" ]; then
+      IGNORE_NOAI_RES+=("$(ignore_glob_to_regex "$pat")")
+    else
+      IGNORE_MANUAL_RES+=("$(ignore_glob_to_regex "$pat")")
+    fi
+  done < "$file"
+  return 0
+}
+
+# Carrega o .commitiaignore da raiz do repositório (ausente = sem regras, sem erro)
+load_ignore_rules() {
+  IGNORE_MANUAL_RES=()
+  IGNORE_NOAI_RES=()
+
+  local root file total
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  [ -n "$root" ] || return 0
+  file="$root/$IGNORE_FILE_NAME"
+  { [ -f "$file" ] && [ -r "$file" ]; } || return 0
+
+  parse_ignore_file "$file"
+  total=$(( ${#IGNORE_MANUAL_RES[@]} + ${#IGNORE_NOAI_RES[@]} ))
+  if [ "$total" -gt 0 ]; then
+    info "Usando $IGNORE_FILE_NAME do projeto: $total regra(s) (${#IGNORE_NOAI_RES[@]} com '+', ${#IGNORE_MANUAL_RES[@]} sem prefixo)"
+  fi
+  return 0
+}
+
+# O caminho casa com algum dos regexes ($2...)?
+ignore_match_any() {
+  local path="$1" re
+  shift
+  for re in "$@"; do
+    if [[ "$path" =~ $re ]]; then return 0; fi
+  done
+  return 1
+}
+
+# Entrada sem prefixo: não adicionar automaticamente (só entra se já estiver staged)
+is_manual_only_path() {
+  [ ${#IGNORE_MANUAL_RES[@]} -gt 0 ] || return 1
+  ignore_match_any "$1" "${IGNORE_MANUAL_RES[@]}"
+}
+
+# Entrada com '+': commitado normalmente, mas o diff não é enviado à IA
+is_ai_excluded_path() {
+  [ ${#IGNORE_NOAI_RES[@]} -gt 0 ] || return 1
+  ignore_match_any "$1" "${IGNORE_NOAI_RES[@]}"
+}
+
+# $1 está na lista ($2...)?
+ignore_array_contains() {
+  local needle="$1" x
+  shift
+  for x in "$@"; do
+    if [ "$x" = "$needle" ]; then return 0; fi
+  done
+  return 1
+}
+
+# Lista (separada por NUL) os arquivos staged do escopo atual
+list_staged_z() {
+  if [ ${#SCOPE_SPECS[@]} -gt 0 ]; then
+    git diff --staged --name-only -z --no-renames -- "${SCOPE_SPECS[@]}" 2>/dev/null
+  else
+    git diff --staged --name-only -z --no-renames 2>/dev/null
+  fi
+}
+
+# Preenche AI_EXCLUDED_FILES com os arquivos staged (no escopo atual) casando com '+'
+collect_ai_excluded_files() {
+  AI_EXCLUDED_FILES=()
+  [ ${#IGNORE_NOAI_RES[@]} -gt 0 ] || return 0
+  local f
+  while IFS= read -r -d '' f; do
+    if is_ai_excluded_path "$f"; then AI_EXCLUDED_FILES+=("$f"); fi
+  done < <(list_staged_z)
+  return 0
+}
+
+# Monta DIFF_SPECS: escopo atual + exclusão (literal) dos arquivos '+' staged.
+# Sem arquivos '+' no stage, DIFF_SPECS = escopo (ou vazio): comportamento original.
+build_diff_specs() {
+  DIFF_SPECS=()
+  collect_ai_excluded_files
+  if [ ${#SCOPE_SPECS[@]} -gt 0 ]; then
+    DIFF_SPECS=("${SCOPE_SPECS[@]}")
+  elif [ ${#AI_EXCLUDED_FILES[@]} -gt 0 ]; then
+    DIFF_SPECS=(":/")
+  fi
+  local f
+  for f in ${AI_EXCLUDED_FILES[@]+"${AI_EXCLUDED_FILES[@]}"}; do
+    DIFF_SPECS+=(":(top,exclude,literal)$f")
+  done
+  return 0
+}
+
+# Nota anexada ao diff: lista (só os nomes) dos arquivos do commit cujo conteúdo foi omitido
+print_ai_omitted_note() {
+  [ ${#AI_EXCLUDED_FILES[@]} -gt 0 ] || return 0
+  local list="" f
+  for f in "${AI_EXCLUDED_FILES[@]}"; do
+    list="${list:+$list, }$f"
+  done
+  printf '\n[Nota: estes arquivos também fazem parte deste commit, mas o conteúdo foi omitido por configuração do usuário (%s): %s. Não tente ler nem inferir o conteúdo deles.]\n' "$IGNORE_FILE_NAME" "$list"
+  return 0
+}
+
+# Todos os arquivos staged do grupo atual são '+' (nada a enviar à IA)?
+staged_group_fully_ai_excluded() {
+  [ ${#IGNORE_NOAI_RES[@]} -gt 0 ] || return 1
+  local f total=0 excluded=0
+  while IFS= read -r -d '' f; do
+    total=$((total + 1))
+    if is_ai_excluded_path "$f"; then excluded=$((excluded + 1)); fi
+  done < <(list_staged_z)
+  [ "$total" -gt 0 ] && [ "$total" -eq "$excluded" ]
+}
+
+# Adiciona alterações ao stage respeitando o .commitiaignore.
+# Sem argumentos equivale a 'git add .'; com argumentos, a 'git add <args>'.
+#  - Sem entradas sem prefixo, roda exatamente o 'git add' original.
+#  - Arquivos que casam com entrada sem prefixo NÃO são adicionados (ficam em
+#    IGNORE_SKIPPED), exceto os já staged (o stage manual é preservado: nunca
+#    são re-adicionados nem removidos) e os passados explicitamente como arquivo
+#    na linha de comando (escolha explícita, equivale a um 'git add' manual).
+stage_changes() {
+  IGNORE_SKIPPED=()
+  if [ ${#IGNORE_MANUAL_RES[@]} -eq 0 ]; then
+    if [ $# -eq 0 ]; then git add .; else git add "$@"; fi
+    return 0
+  fi
+
+  local a f
+  local -a explicit=() specs=() staged=() to_add=()
+  if [ $# -eq 0 ]; then
+    specs=(.)
+  else
+    for a in "$@"; do
+      if [ -d "$a" ]; then specs+=("$a"); else explicit+=("$a"); fi
+    done
+  fi
+
+  if [ ${#explicit[@]} -gt 0 ]; then git add "${explicit[@]}"; fi
+  [ ${#specs[@]} -gt 0 ] || return 0
+
+  while IFS= read -r -d '' f; do
+    staged+=("$f")
+  done < <(git diff --staged --name-only -z --no-renames 2>/dev/null)
+
+  # modificados, deletados e novos (não ignorados pelo .gitignore) sob os pathspecs
+  while IFS= read -r -d '' f; do
+    if is_manual_only_path "$f"; then
+      if ! ignore_array_contains "$f" ${staged[@]+"${staged[@]}"}; then
+        IGNORE_SKIPPED+=("$f")
+      fi
+      continue
+    fi
+    to_add+=(":(top,literal)$f")
+  done < <(git ls-files -z --full-name --modified --others --deleted --exclude-standard -- "${specs[@]}" 2>/dev/null | sort -zu)
+
+  local n=${#to_add[@]} k=0
+  while [ "$k" -lt "$n" ]; do
+    git add -- "${to_add[@]:$k:200}"
+    k=$((k + 200))
+  done
+  return 0
 }
 
 # ============================================================================
@@ -792,10 +1466,13 @@ get_staged_diff() {
     return 0
   fi
 
+  # Escopo atual + exclusão dos arquivos '+' do .commitiaignore (conteúdo não vai à IA)
+  build_diff_specs
+
   if [ "$DIFF_TRUNCATE" = true ]; then
     local out
-    if [ ${#SCOPE_SPECS[@]} -gt 0 ]; then
-      out=$(git diff --staged -- "${SCOPE_SPECS[@]}" | head -c $((COMMITIA_MAX_DIFF_CHARS + 1)))
+    if [ ${#DIFF_SPECS[@]} -gt 0 ]; then
+      out=$(git diff --staged -- "${DIFF_SPECS[@]}" | head -c $((COMMITIA_MAX_DIFF_CHARS + 1)))
     else
       out=$(git diff --staged | head -c $((COMMITIA_MAX_DIFF_CHARS + 1)))
     fi
@@ -803,14 +1480,12 @@ get_staged_diff() {
       out="${out:0:$COMMITIA_MAX_DIFF_CHARS}"$'\n'"... [diff truncado]"
     fi
     printf '%s\n' "$out"
-    return 0
-  fi
-
-  if [ ${#SCOPE_SPECS[@]} -gt 0 ]; then
-    git diff --staged -- "${SCOPE_SPECS[@]}"
+  elif [ ${#DIFF_SPECS[@]} -gt 0 ]; then
+    git diff --staged -- "${DIFF_SPECS[@]}"
   else
     git diff --staged
   fi
+  print_ai_omitted_note
 }
 
 get_staged_files() {
@@ -879,7 +1554,9 @@ generate_with_amp() {
 
   # Em arquivos grandes (escopo restrito ou resumo) o conteúdo vai no próprio prompt,
   # pois o amp executaria 'git diff --staged' sobre todo o stage
-  if [ "$DIFF_MODE" = "summary" ] || [ ${#SCOPE_SPECS[@]} -gt 0 ]; then
+  # O mesmo vale quando há arquivos '+' do .commitiaignore no stage (o amp não pode ver o diff deles)
+  build_diff_specs
+  if [ "$DIFF_MODE" = "summary" ] || [ ${#SCOPE_SPECS[@]} -gt 0 ] || [ ${#AI_EXCLUDED_FILES[@]} -gt 0 ]; then
     prompt="${prompt}"$'\n\n'"Conteúdo a analisar (use somente isto; NÃO execute comandos):"$'\n'"$(get_staged_diff)"
   fi
 
@@ -1293,6 +1970,14 @@ detect_large_files() {
     deleted="${rest%%$'\t'*}"
     p="${rest#*$'\t'}"
 
+    # Arquivo '+' do .commitiaignore: não vai à IA, então o tamanho não importa;
+    # entra no commit "normal" (junto com os pequenos), sem commit separado
+    if is_ai_excluded_path "$p"; then
+      SMALL_FILES+=("$p")
+      i=$((i + 1))
+      continue
+    fi
+
     is_bin=false
     [ "$added" = "-" ] && is_bin=true
 
@@ -1380,6 +2065,11 @@ build_large_summary() {
     if [ "$shown" -gt 40 ]; then
       out+=$'\n'"... e mais $((total - 40)) arquivo(s)"
       break
+    fi
+    # Arquivo '+' do .commitiaignore: só o nome (nem contagem de linhas nem amostras)
+    if is_ai_excluded_path "$f"; then
+      out+=$'\n'"- $f: alterado (conteúdo omitido por configuração do usuário em $IGNORE_FILE_NAME)"
+      continue
     fi
     spec=":(top,literal)$f"
     line=$(git diff --staged --numstat --no-renames -- "$spec" 2>/dev/null | head -n 1)
@@ -1586,7 +2276,12 @@ commit_staged_group() {
   COMMIT_MSG=""
   local prompt
 
-  if [ "$skip_full" = true ]; then
+  if staged_group_fully_ai_excluded; then
+    # Todos os arquivos do commit são '+' no .commitiaignore: não há nada a enviar à IA
+    info "Todos os arquivos deste commit estão marcados com '+' no $IGNORE_FILE_NAME: nada é enviado à IA"
+    COMMIT_MSG=$(fallback_commit_message)
+    MSG_SOURCE="ignorado"
+  elif [ "$skip_full" = true ]; then
     info "Arquivo binário: o diff não será enviado, apenas um resumo"
   else
     prompt=$(build_prompt "$TASK_ID" "$ctx" "$FORCED_TYPE" "$FORCED_SCOPE" "$LANGUAGE" full)
@@ -1649,6 +2344,7 @@ commit_staged_group() {
   case "$MSG_SOURCE" in
     resumo) info "Mensagem gerada pelo fallback (nome, linhas alteradas e contexto resumido)" ;;
     minimo) warn "A IA falhou; usada mensagem padrão de último recurso" ;;
+    ignorado) info "Mensagem padrão: o conteúdo dos arquivos deste commit não é enviado à IA ($IGNORE_FILE_NAME)" ;;
   esac
   echo ""
 
@@ -1817,10 +2513,365 @@ run_large_files_flow() {
 }
 
 # ============================================================================
+# Skill para agentes de IA (commitia skill)
+#
+# Gera uma "Agent Skill" (SKILL.md) que ensina agentes de IA a usar o commitia
+# para commitar. O mesmo arquivo serve ao Cursor, ao VS Code/GitHub Copilot e
+# ao Claude Code (formato aberto: frontmatter YAML + instruções em Markdown).
+# ============================================================================
+
+SKILL_NAME="commitia"
+SKILL_DEFAULT_FILE="commitia-skill.md"
+
+# Conteúdo da skill (em stdout). Versão do commitia gravada para facilitar a atualização.
+print_skill_content() {
+  cat <<'EOF_FRONT'
+---
+name: commitia
+description: "Cria commits Git com mensagem no padrão Conventional Commits gerada por IA, usando a CLI `commitia`. Use sempre que o usuário pedir para commitar, fazer commit, salvar alterações no Git ou gerar a mensagem de um commit."
+---
+EOF_FRONT
+  printf '<!-- Gerada pelo commitia v%s (commitia skill). Para atualizar: commitia skill <destino> --force -->\n' "$VERSION"
+  cat <<'EOF_BODY'
+
+# Commits com o CommitIA
+
+O `commitia` é uma CLI que lê o diff do stage do Git, gera a mensagem de commit com IA
+(padrão [Conventional Commits](https://www.conventionalcommits.org/)) e executa o `git commit`.
+**Para commitar neste projeto, use o `commitia` em vez de escrever a mensagem manualmente.**
+
+## Quando usar
+
+- O usuário pediu para "commitar", "fazer commit", "salvar no git" ou "gerar mensagem de commit".
+- Você terminou uma tarefa e o usuário pediu que as alterações fossem commitadas.
+
+Não faça `git push`, não crie branches e não use `--amend` a menos que o usuário peça.
+
+## Pré-requisitos
+
+- Dentro de um repositório Git e com a CLI instalada: `commitia --version`.
+- Um provedor de IA configurado (`COMMITIA_PROVIDER` em `.commitiarc` ou `~/.commitiarc`).
+  Se o comando falhar por falta de provedor/login, informe o usuário em vez de contornar.
+
+## Fluxo recomendado
+
+1. Entenda o que mudou: `git status --short` e `git diff`.
+2. Coloque no stage **somente** os arquivos que pertencem a este commit:
+   `git add <arquivo1> <arquivo2>`.
+3. Commite o que está no stage, sem adicionar mais nada:
+
+   ```bash
+   commitia --no-stage
+   ```
+
+   Para dar contexto do porquê da mudança (a mensagem continua sendo gerada a partir do diff):
+
+   ```bash
+   commitia --no-stage -m "corrige falha de autenticação ao expirar o token"
+   ```
+
+4. Confira o resultado: `git log -1 --stat`.
+
+Se houver várias mudanças independentes, faça **um commit por assunto**: repita os passos 2 e 3
+para cada grupo de arquivos.
+
+> Sem `--no-stage` e sem arquivos informados, o commitia usa o que já está no stage; se o stage
+> estiver vazio, executa `git add .` e inclui **tudo** (inclusive arquivos novos não relacionados).
+> Por isso prefira a abordagem acima, com stage explícito.
+
+### Atalhos
+
+| Comando | O que faz |
+| --- | --- |
+| `commitia` | Commita o stage; se vazio, adiciona tudo (`git add .`) e commita |
+| `commitia src/ README.md` | Adiciona esses caminhos ao stage e commita (o que já estava no stage também entra) |
+| `commitia --no-stage` | Commita apenas o que já está no stage (erro se estiver vazio) |
+| `commitia -d` | Dry-run: mostra a mensagem que seria usada, sem commitar |
+
+## Opções
+
+| Opção | Descrição |
+| --- | --- |
+| `-m, --message <texto>` | Contexto adicional para a IA (o motivo da mudança) |
+| `-t, --type <tipo>` | Força o tipo: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`, `perf`, `ci`, `build`, `revert` |
+| `-s, --scope <escopo>` | Define o escopo manualmente |
+| `-d, --dry-run` | Só mostra a mensagem, sem commitar |
+| `-a, --amend` | Altera o último commit (só se o usuário pedir) |
+| `--no-stage` | Não adiciona arquivos ao stage automaticamente |
+| `--provider <nome>` | Provedor de IA: `amp`, `openai`, `gemini`, `ollama`, `cursor`, `copilot`, `claude`, `codex`, `gemini-cli` |
+| `--lang <pt\|en\|es>` | Idioma da mensagem |
+| `-i, --interactive` | **Não use**: pede confirmação pelo teclado e trava em ambientes sem terminal |
+| `--update`, `--force` | Atualiza o commitia (só se o usuário pedir) |
+
+Exemplos:
+
+```bash
+commitia --no-stage -t fix -s auth -m "evita logout indevido"
+commitia --no-stage --lang en
+commitia -d --no-stage        # pré-visualiza a mensagem
+```
+
+## Mensagem gerada
+
+- Formato `tipo(escopo): descrição`, descrição curta, em minúscula e sem ponto final.
+- O escopo é detectado da branch quando ela tem um ID de tarefa (`feature/ENP-1234-algo` →
+  `ENP-1234`); caso contrário a IA infere dos arquivos. `-s` sobrescreve.
+- O idioma vem de `COMMITIA_LANGUAGE` (padrão `pt`) ou de `--lang`.
+
+## Arquivos grandes
+
+Lockfiles (`pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`, `Cargo.lock`...) e diffs enormes são
+commitados automaticamente em **commits separados**: primeiro os arquivos pequenos, depois cada
+arquivo grande. Se a IA falhar nesses arquivos, o commitia usa um fallback e, em último caso, uma
+mensagem padrão (`chore(deps): atualiza <arquivo>`). Você não precisa tratar isso manualmente
+(com `--amend` não há separação).
+
+## Tratando erros
+
+- O comando termina com código diferente de 0 quando falha. Leia a saída antes de tentar de novo.
+- Falhas da IA e de hooks (commitlint, husky, pre-commit) geram logs em `.commitia/logs/`
+  (o caminho aparece na saída). Corrija a causa e rode o commitia novamente.
+- `Não há alterações para commitar` / `no stage`: nada a commitar ou nada no stage; confira com `git status`.
+- `a CLI '...' precisa ser atualizada`: a CLI do provedor está desatualizada; informe o usuário
+  (o comando de atualização aparece na saída) ou use `--provider` com outro provedor.
+- Aviso de nova versão do commitia: fora de terminal ele apenas informa. Não atualize por conta
+  própria; para silenciar use `COMMITIA_SKIP_UPDATE_CHECK=true`.
+- Só escreva a mensagem manualmente (`git commit -m "tipo(escopo): descrição"`) se o commitia
+  estiver indisponível ou o usuário pedir, mantendo o padrão Conventional Commits.
+
+## Configuração
+
+Ordem de prioridade: linha de comando > `.commitiarc` na raiz do projeto > `~/.commitiarc` > padrões.
+O arquivo é um script shell com variáveis, por exemplo:
+
+```bash
+COMMITIA_PROVIDER="claude"
+COMMITIA_LANGUAGE="pt"
+COMMITIA_AUTO_STAGE="true"
+COMMITIA_LARGE_FILES="true"
+```
+
+Não altere esses arquivos sem o usuário pedir.
+EOF_BODY
+}
+
+print_skill_help() {
+  echo -e "${BOLD}USO:${NC}"
+  echo "  $SCRIPT_NAME skill [destino...] [opções]"
+  echo ""
+  echo "  Gera uma skill (SKILL.md) que ensina agentes de IA a usar o commitia para commitar."
+  echo ""
+  echo -e "${BOLD}DESTINOS:${NC}"
+  echo "  cursor     Cursor          (.cursor/skills/commitia/SKILL.md)"
+  echo "  vscode     VS Code         (.github/skills/commitia/SKILL.md)"
+  echo "  copilot    GitHub Copilot  (.github/skills/commitia/SKILL.md; global: ~/.copilot/skills)"
+  echo "  claude     Claude Code     (.claude/skills/commitia/SKILL.md)"
+  echo "  file       Apenas gera o arquivo, para você incluir onde preferir (padrão: ./$SKILL_DEFAULT_FILE)"
+  echo ""
+  echo "  Sem destino, em terminal interativo, o commitia pergunta onde instalar."
+  echo "  Você pode informar vários destinos: $SCRIPT_NAME skill cursor copilot"
+  echo ""
+  echo -e "${BOLD}OPÇÕES:${NC}"
+  echo "  -g, --global           Instala no diretório do usuário (vale para todos os projetos)"
+  echo "  -o, --output <caminho> Com 'file': arquivo de saída ('-' imprime na tela)"
+  echo "  --force                Sobrescreve uma skill existente diferente"
+  echo "  -d, --dry-run          Mostra o que seria gravado, sem criar arquivos"
+  echo "  -h, --help             Mostra esta ajuda"
+  echo ""
+  echo -e "${BOLD}EXEMPLOS:${NC}"
+  echo "  $SCRIPT_NAME skill cursor              # skill do projeto atual, para o Cursor"
+  echo "  $SCRIPT_NAME skill copilot --global    # skill pessoal do GitHub Copilot"
+  echo "  $SCRIPT_NAME skill file -o -           # imprime a skill na tela"
+  echo "  $SCRIPT_NAME skill file -o docs/ia/SKILL.md"
+  echo ""
+}
+
+# Normaliza o nome do destino (retorna 1 se for inválido)
+normalize_skill_target() {
+  case "$1" in
+    cursor) echo "cursor" ;;
+    vscode|vs-code|code) echo "vscode" ;;
+    copilot|github|github-copilot) echo "copilot" ;;
+    claude|claude-code) echo "claude" ;;
+    file|arquivo|print) echo "file" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Raiz do projeto: raiz do repositório Git ou, fora de um, o diretório atual
+skill_project_root() {
+  local root
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || root=""
+  [ -n "$root" ] || root="$PWD"
+  printf '%s' "$root"
+}
+
+# Diretório "skills" do destino. $1: destino; $2: true = global (home do usuário)
+skill_base_dir() {
+  local target="$1" global="$2" rel_project rel_global
+  case "$target" in
+    cursor)  rel_project=".cursor/skills";  rel_global=".cursor/skills" ;;
+    vscode)  rel_project=".github/skills";  rel_global=".copilot/skills" ;;
+    copilot) rel_project=".github/skills";  rel_global=".copilot/skills" ;;
+    claude)  rel_project=".claude/skills";  rel_global=".claude/skills" ;;
+    *) return 1 ;;
+  esac
+  if [ "$global" = true ]; then
+    printf '%s/%s' "$HOME" "$rel_global"
+  else
+    printf '%s/%s' "$(skill_project_root)" "$rel_project"
+  fi
+}
+
+# Grava a skill em $1 (arquivo). Retorna 0 em sucesso (inclusive "já atualizada")
+# e 1 se já existe um arquivo diferente e --force não foi usado.
+write_skill_file() {
+  local dest="$1" force="$2" dry="$3" tmp
+
+  tmp=$(mktemp) || error "Não foi possível criar arquivo temporário"
+  print_skill_content > "$tmp"
+
+  if [ -e "$dest" ] && cmp -s "$tmp" "$dest"; then
+    rm -f "$tmp"
+    success "Skill já está atualizada: $dest"
+    return 0
+  fi
+
+  if [ -e "$dest" ] && [ "$force" != true ]; then
+    rm -f "$tmp"
+    warn "Já existe uma skill diferente em: $dest (use --force para sobrescrever)"
+    return 1
+  fi
+
+  if [ "$dry" = true ]; then
+    rm -f "$tmp"
+    info "Modo dry-run: gravaria a skill em $dest"
+    return 0
+  fi
+
+  if ! mkdir -p "$(dirname "$dest")" 2>/dev/null || ! cp "$tmp" "$dest" 2>/dev/null; then
+    rm -f "$tmp"
+    error "Não foi possível gravar a skill em $dest. Verifique as permissões."
+  fi
+  rm -f "$tmp"
+  success "Skill gravada em: $dest"
+  return 0
+}
+
+# Pergunta (menu numerado) onde instalar. Define SKILL_TARGETS e, se aplicável, SKILL_GLOBAL.
+# Retorna 1 se não for possível perguntar ou a resposta for inválida.
+prompt_skill_targets() {
+  is_interactive_terminal || return 1
+
+  echo -e "${BOLD}Onde deseja criar a skill do commitia?${NC}"
+  echo "  1) Cursor"
+  echo "  2) VS Code"
+  echo "  3) GitHub Copilot"
+  echo "  4) Claude Code"
+  echo "  5) Apenas gerar o arquivo (para incluir onde preferir)"
+  echo -n "Opção [1-5]: "
+  local choice=""
+  read -r choice || true
+  case "$choice" in
+    1) SKILL_TARGETS+=("cursor") ;;
+    2) SKILL_TARGETS+=("vscode") ;;
+    3) SKILL_TARGETS+=("copilot") ;;
+    4) SKILL_TARGETS+=("claude") ;;
+    5) SKILL_TARGETS+=("file"); return 0 ;;
+    *) warn "Opção inválida: '$choice'"; return 1 ;;
+  esac
+
+  if [ "$SKILL_GLOBAL" != true ]; then
+    echo -e "${BOLD}Escopo da skill:${NC}"
+    echo "  1) Somente este projeto"
+    echo "  2) Todos os projetos (global, no seu usuário)"
+    echo -n "Opção [1-2]: "
+    local scope=""
+    read -r scope || true
+    [ "$scope" = "2" ] && SKILL_GLOBAL=true
+  fi
+  return 0
+}
+
+# Subcomando: commitia skill [destino...] [opções]
+do_skill() {
+  SKILL_TARGETS=()
+  SKILL_GLOBAL=false
+  local force=false dry=false output="" arg normalized
+
+  while [[ $# -gt 0 ]]; do
+    arg="$1"
+    case "$arg" in
+      -h|--help)
+        print_banner
+        print_skill_help
+        return 0
+        ;;
+      -g|--global) SKILL_GLOBAL=true; shift ;;
+      --force) force=true; shift ;;
+      -d|--dry-run) dry=true; shift ;;
+      -o|--output)
+        [ $# -ge 2 ] || error "A opção $arg exige um caminho (ou '-' para imprimir na tela)"
+        output="$2"
+        shift 2
+        ;;
+      -*) error "Opção desconhecida para 'skill': $arg (veja: $SCRIPT_NAME skill --help)" ;;
+      *)
+        normalized=$(normalize_skill_target "$arg") || \
+          error "Destino desconhecido: $arg (use: cursor, vscode, copilot, claude ou file)"
+        SKILL_TARGETS+=("$normalized")
+        shift
+        ;;
+    esac
+  done
+
+  if [ ${#SKILL_TARGETS[@]} -eq 0 ]; then
+    if ! prompt_skill_targets; then
+      echo "" >&2
+      echo -e "${RED}✗ Erro: informe o destino da skill${NC}" >&2
+      echo "  Uso: $SCRIPT_NAME skill <cursor|vscode|copilot|claude|file> [--global]" >&2
+      echo "  Ajuda: $SCRIPT_NAME skill --help" >&2
+      return 1
+    fi
+  fi
+
+  local target dest rc=0 had_file=false
+  for target in "${SKILL_TARGETS[@]}"; do
+    if [ "$target" = "file" ]; then
+      had_file=true
+      dest="${output:-./$SKILL_DEFAULT_FILE}"
+      if [ "$dest" = "-" ]; then
+        print_skill_content
+        continue
+      fi
+      write_skill_file "$dest" "$force" "$dry" || rc=1
+    else
+      dest="$(skill_base_dir "$target" "$SKILL_GLOBAL")/$SKILL_NAME/SKILL.md"
+      write_skill_file "$dest" "$force" "$dry" || rc=1
+    fi
+  done
+
+  if [ -n "$output" ] && [ "$had_file" != true ]; then
+    warn "A opção --output só vale com o destino 'file'"
+  fi
+  return $rc
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 
 main() {
+  ORIG_ARGS=("$@")
+
+  # Subcomando 'skill' (só quando é o primeiro argumento; para commitar um
+  # arquivo chamado "skill", use ./skill)
+  if [ "${1:-}" = "skill" ]; then
+    shift
+    do_skill "$@"
+    exit $?
+  fi
+
   # Parse de argumentos
   FILES=()
   CONTEXT_MSG=""
@@ -1906,8 +2957,14 @@ main() {
   # Carrega configuração
   load_config
   
+  # Nova versão do commitia? (antes de validar CLIs e de gerar/aplicar o commit)
+  check_self_update
+
   # Verificações
   check_dependencies
+
+  # Regras do .commitiaignore (opcional): o que não é adicionado sozinho / não vai à IA
+  load_ignore_rules
   
   # Stage de arquivos
   if [ "$AUTO_STAGE" = true ]; then
@@ -1915,19 +2972,30 @@ main() {
       if ! check_staged_changes; then
         if check_unstaged_changes; then
           info "Adicionando todas as alterações ao stage..."
-          git add .
+          stage_changes
         else
           error "Não há alterações para commitar"
         fi
       fi
     else
       info "Adicionando arquivos ao stage: ${FILES[*]}"
-      git add "${FILES[@]}"
+      stage_changes "${FILES[@]}"
     fi
+  fi
+
+  # Arquivos que o .commitiaignore (sem prefixo) impediu de adicionar automaticamente
+  if [ ${#IGNORE_SKIPPED[@]} -gt 0 ]; then
+    info "Não adicionados automaticamente ($IGNORE_FILE_NAME, sem prefixo; use 'git add <arquivo>' para incluí-los):"
+    for file in "${IGNORE_SKIPPED[@]}"; do
+      echo -e "  ${YELLOW}⊘${NC} $file"
+    done
   fi
   
   # Verifica se há alterações staged
   if ! check_staged_changes; then
+    if [ ${#IGNORE_SKIPPED[@]} -gt 0 ]; then
+      error "Não há alterações no stage para commitar (os arquivos alterados estão no $IGNORE_FILE_NAME)"
+    fi
     error "Não há alterações no stage para commitar"
   fi
   
@@ -1935,7 +3003,11 @@ main() {
   echo ""
   info "Arquivos no stage:"
   get_staged_files | while read -r file; do
-    echo -e "  ${CYAN}→${NC} $file"
+    if is_ai_excluded_path "$file"; then
+      echo -e "  ${CYAN}→${NC} $file ${YELLOW}(commitado; conteúdo não enviado à IA)${NC}"
+    else
+      echo -e "  ${CYAN}→${NC} $file"
+    fi
   done
   echo ""
   
